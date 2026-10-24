@@ -1,0 +1,99 @@
+"""CLI entrypoint: `trading-agents run-backtest [--universe ... --start ... --end ...]`.
+
+Wires every agent, the LLM client, the paper broker, and a cached
+yfinance data provider together, then runs a backtest and prints summary
+stats. This is the first thing to run end-to-end once an Anthropic API key
+is in `.env` — see the README for the manual opt-in live-LLM smoke test.
+"""
+
+import argparse
+import asyncio
+
+from trading_agents.agents.analysts.fundamentals import FundamentalsAnalystAgent
+from trading_agents.agents.analysts.news import NewsAnalystAgent
+from trading_agents.agents.analysts.sentiment import SentimentAnalystAgent
+from trading_agents.agents.analysts.technical import TechnicalAnalystAgent
+from trading_agents.agents.portfolio_manager import PortfolioManagerAgent
+from trading_agents.agents.researcher import ResearcherAgent
+from trading_agents.agents.risk_manager import RiskManagerAgent
+from trading_agents.agents.screener import ScreenerAgent
+from trading_agents.agents.trader import TraderAgent
+from trading_agents.backtest.runner import BacktestRunner
+from trading_agents.brokers.paper import PaperBrokerAdapter
+from trading_agents.config.settings import Settings
+from trading_agents.contracts.backtest import BacktestResult
+from trading_agents.data.cache import CachedDataProvider, ParquetCache
+from trading_agents.data.providers.yfinance_provider import YFinanceProvider
+from trading_agents.llm.client import AnthropicLLMClient, LLMClient
+from trading_agents.orchestration.pipeline import DecisionCycleOrchestrator
+
+
+def build_orchestrator(llm_client: LLMClient) -> DecisionCycleOrchestrator:
+    return DecisionCycleOrchestrator(
+        screener=ScreenerAgent(llm_client),
+        fundamentals_analyst=FundamentalsAnalystAgent(llm_client),
+        sentiment_analyst=SentimentAnalystAgent(llm_client),
+        news_analyst=NewsAnalystAgent(llm_client),
+        technical_analyst=TechnicalAnalystAgent(llm_client),
+        researcher=ResearcherAgent(llm_client),
+        trader=TraderAgent(llm_client),
+        risk_manager=RiskManagerAgent(llm_client),
+        portfolio_manager=PortfolioManagerAgent(llm_client),
+    )
+
+
+async def run_backtest(settings: Settings) -> BacktestResult:
+    llm_client = AnthropicLLMClient(api_key=settings.anthropic_api_key.get_secret_value())
+    orchestrator = build_orchestrator(llm_client)
+
+    data_provider = CachedDataProvider(YFinanceProvider(), ParquetCache(settings.data_cache_dir))
+    broker = PaperBrokerAdapter(
+        initial_cash=settings.initial_cash, historical_provider=data_provider
+    )
+    await broker.connect()
+    try:
+        runner = BacktestRunner(
+            orchestrator=orchestrator, broker=broker, data_provider=data_provider
+        )
+        return await runner.run(
+            start_date=settings.backtest_start_date,
+            end_date=settings.backtest_end_date,
+            universe=settings.ticker_universe,
+        )
+    finally:
+        await broker.disconnect()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="trading-agents")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    backtest_parser = subparsers.add_parser("run-backtest")
+    backtest_parser.add_argument("--universe", help="Comma-separated tickers, e.g. AAPL,MSFT")
+    backtest_parser.add_argument("--start", help="YYYY-MM-DD")
+    backtest_parser.add_argument("--end", help="YYYY-MM-DD")
+
+    args = parser.parse_args()
+
+    overrides = {}
+    if args.universe:
+        overrides["ticker_universe"] = args.universe
+    if args.start:
+        overrides["backtest_start_date"] = args.start
+    if args.end:
+        overrides["backtest_end_date"] = args.end
+    settings = Settings(**overrides)
+
+    result = asyncio.run(run_backtest(settings))
+    print(f"Period: {result.start_date} -> {result.end_date}")
+    print(f"Universe: {', '.join(result.ticker_universe)}")
+    print(f"Total return: {result.total_return_pct:.2f}%")
+    print(f"Sharpe ratio: {result.sharpe_ratio:.2f}")
+    print(f"Max drawdown: {result.max_drawdown_pct:.2f}%")
+    print(f"Win rate: {result.win_rate:.0%}")
+    print(f"Trades: {len(result.trade_log)}")
+    print(f"Final equity: {result.final_portfolio_state.equity:.2f}")
+
+
+if __name__ == "__main__":
+    main()
