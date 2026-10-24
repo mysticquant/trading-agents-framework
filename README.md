@@ -16,7 +16,7 @@ service are future phases — see "Out of scope" below.
 ```powershell
 python -m venv .venv
 .venv\Scripts\pip install -e ".[dev]"
-copy .env.example .env   # then fill in ANTHROPIC_API_KEY
+copy .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally SEC_USER_AGENT)
 ```
 
 ## Running tests
@@ -65,7 +65,8 @@ touches a real brokerage account.
   future low-latency execution service, implement the same Protocol
   without any orchestration-layer changes.
 - `data/` — `HistoricalDataProvider` Protocol, the `YFinanceProvider`
-  implementation, and a parquet-backed cache.
+  implementation, and a parquet-backed cache. `data/evidence/` builds the
+  fundamentals/sentiment/news analysts' evidence (see below).
 - `orchestration/` — `DecisionCycleOrchestrator`, a hand-rolled async
   pipeline (Screener → 4 parallel Analysts per ticker → Researcher →
   Trader → RiskManager → PortfolioManager) over a shared state object.
@@ -73,15 +74,39 @@ touches a real brokerage account.
   against `PaperBrokerAdapter`) and `metrics.py` (return, Sharpe, max
   drawdown, win rate).
 
+## Analyst evidence
+
+The fundamentals, sentiment, and news analysts get their evidence from
+`DefaultEvidenceProvider` (`data/evidence/`). Every record carries the time
+it became public, and only records public **strictly before** the decision
+time are used. Backtest decisions use midnight of the trading day, so
+nothing released that day (e.g. after-close earnings) can leak in.
+
+| Analyst | Source | History usable in backtests |
+|---|---|---|
+| Fundamentals | yfinance earnings releases (EPS, surprise, TTM EPS, P/E) | ~20 years |
+| | yfinance quarterly statements (margins, revenue growth, leverage) | last ~5 quarters only |
+| Sentiment | yfinance analyst upgrades/downgrades and price targets (90-day window) | years |
+| | short interest, consensus rating | live only (current snapshot) |
+| News | SEC EDGAR 8-K material events and 10-Q/10-K filings (30-day window) | years |
+| | Yahoo headlines (7-day window) | live only (last few days) |
+
+SEC filings are fetched only when `SEC_USER_AGENT` is set in `.env`. SEC's
+fair-access policy requires it to name you with a contact email, e.g.
+`SEC_USER_AGENT=Jane Doe jane@example.com`. When a source is unavailable
+or fails, the evidence says so explicitly (`note` / `source_errors`), and
+the analyst prompts tell the model to return a low-confidence neutral
+signal rather than reading meaning into missing data.
+
+Raw data is cached in memory (6 hours) so a backtest fetches each source
+once per ticker per run. yfinance values can be restated after the fact,
+so fundamentals are close to, but not exactly, what was known at the time.
+
 ## Known gaps in this phase
 
-- **Fundamentals/sentiment/news data sourcing isn't wired up.** Those
-  three analysts are fully implemented and tested (see
-  `tests/unit/agents/test_analysts.py`), but `DecisionCycleOrchestrator`
-  defaults their evidence to an empty dict unless a caller supplies
-  `fundamentals_evidence`/`sentiment_evidence`/`news_evidence`. Only the
-  Technical analyst has a real data path today (computed from `yfinance`
-  OHLCV via `indicators/technical.py`).
+- Backtests more than about a year back get no margin/leverage
+  fundamentals (yfinance only serves the last ~5 quarterly statements) and
+  no headlines; EPS, analyst actions, and SEC filings still apply.
 - The backtest runner fills orders at the simulated day's close with fixed
   commission/slippage — there's no intraday or tick-level simulation.
 

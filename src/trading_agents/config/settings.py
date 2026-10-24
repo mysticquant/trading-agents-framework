@@ -26,6 +26,10 @@ class Settings(BaseSettings):
 
     data_cache_dir: Path = Path("data/cache")
 
+    # SEC EDGAR filings (point-in-time news evidence) are fetched only when
+    # this is set; SEC requires it to name you with a contact email.
+    sec_user_agent: str | None = None
+
     llm_role_overrides: dict[str, str] | None = None
 
     @field_validator("ticker_universe", mode="before")

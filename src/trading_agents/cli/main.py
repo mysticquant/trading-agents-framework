@@ -25,6 +25,10 @@ from trading_agents.config.settings import Settings
 from trading_agents.contracts.backtest import BacktestResult
 from trading_agents.contracts.trading import ExecutionCosts
 from trading_agents.data.cache import CachedDataProvider, ParquetCache
+from trading_agents.data.evidence.base import EvidenceProvider
+from trading_agents.data.evidence.provider import DefaultEvidenceProvider
+from trading_agents.data.evidence.sec_edgar import SecEdgarFilingsSource
+from trading_agents.data.evidence.yfinance_source import YFinanceMarketDataSource
 from trading_agents.data.providers.yfinance_provider import YFinanceProvider
 from trading_agents.llm.client import AnthropicLLMClient, LLMClient
 from trading_agents.llm.config import LLMRoleRegistry, RoleModelConfig
@@ -35,6 +39,7 @@ def build_orchestrator(
     llm_client: LLMClient,
     role_registry: LLMRoleRegistry | None = None,
     execution_costs: ExecutionCosts | None = None,
+    evidence_provider: EvidenceProvider | None = None,
 ) -> DecisionCycleOrchestrator:
     registry = role_registry or LLMRoleRegistry()
 
@@ -52,7 +57,13 @@ def build_orchestrator(
         risk_manager=RiskManagerAgent(llm_client, config(RiskManagerAgent)),
         portfolio_manager=PortfolioManagerAgent(llm_client, config(PortfolioManagerAgent)),
         execution_costs=execution_costs,
+        evidence_provider=evidence_provider,
     )
+
+
+def build_evidence_provider(settings: Settings) -> EvidenceProvider:
+    filings = SecEdgarFilingsSource(settings.sec_user_agent) if settings.sec_user_agent else None
+    return DefaultEvidenceProvider(YFinanceMarketDataSource(), filings)
 
 
 async def run_backtest(settings: Settings) -> BacktestResult:
@@ -64,6 +75,7 @@ async def run_backtest(settings: Settings) -> BacktestResult:
         llm_client,
         role_registry=LLMRoleRegistry(settings.llm_role_overrides),
         execution_costs=execution_costs,
+        evidence_provider=build_evidence_provider(settings),
     )
 
     data_provider = CachedDataProvider(YFinanceProvider(), ParquetCache(settings.data_cache_dir))

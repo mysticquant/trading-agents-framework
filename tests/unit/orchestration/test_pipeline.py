@@ -18,6 +18,7 @@ from trading_agents.agents.risk_manager import RiskManagerAgent, RiskManagerLLMO
 from trading_agents.agents.screener import ScreenerAgent, ScreenerLLMOutput, ScreenerRanking
 from trading_agents.agents.trader import TraderAgent, TraderLLMOutput
 from trading_agents.contracts.portfolio import PortfolioState
+from trading_agents.data.evidence.base import EvidenceBundle
 from trading_agents.llm.fakes import FakeLLMClient
 from trading_agents.orchestration.pipeline import DecisionCycleOrchestrator
 
@@ -185,6 +186,58 @@ async def test_run_cycle_caps_the_shortlist_at_screener_top_n(bars_factory, cann
     )
 
     assert len(_researcher_calls(llm_client)) == 1
+
+
+class _RecordingEvidenceProvider:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, float]] = []
+
+    async def get_evidence(self, ticker, as_of, price):
+        self.calls.append((ticker, price))
+        return EvidenceBundle(
+            fundamentals={"source": f"provider-fundamentals-{ticker}"},
+            sentiment={"source": f"provider-sentiment-{ticker}"},
+            news={"source": f"provider-news-{ticker}"},
+        )
+
+
+def _evidence_seen(llm_client: FakeLLMClient, role: str) -> dict[str, dict]:
+    return {
+        json.loads(call["user_content"])["ticker"]: json.loads(call["user_content"])["evidence"]
+        for call in llm_client.calls
+        if call["role"] == role
+    }
+
+
+async def test_evidence_provider_feeds_the_evidence_analysts(bars_factory, canned_responses):
+    canned_responses["screener"] = ScreenerLLMOutput(
+        rankings=[ScreenerRanking(ticker="AAPL", score=0.9, rationale="a")]
+    )
+    llm_client = FakeLLMClient(canned_responses)
+    provider = _RecordingEvidenceProvider()
+    orchestrator = _build_orchestrator(llm_client, evidence_provider=provider)
+    aapl_bars = bars_factory("AAPL", 60)
+
+    await orchestrator.run_cycle(
+        as_of=datetime(2024, 1, 1),
+        universe=["AAPL", "MSFT"],
+        market_data={"AAPL": aapl_bars, "MSFT": bars_factory("MSFT", 60, start_price=200.0)},
+        portfolio_state=PortfolioState(
+            cash=100_000.0, equity=100_000.0, realized_pnl=0.0, as_of=datetime(2024, 1, 1)
+        ),
+        news_evidence={"AAPL": {"source": "caller-news"}},
+    )
+
+    # Only the shortlisted ticker is fetched, priced at its latest close.
+    assert provider.calls == [("AAPL", aapl_bars[-1].close)]
+    assert _evidence_seen(llm_client, "fundamentals_analyst")["AAPL"] == {
+        "source": "provider-fundamentals-AAPL"
+    }
+    assert _evidence_seen(llm_client, "sentiment_analyst")["AAPL"] == {
+        "source": "provider-sentiment-AAPL"
+    }
+    # Caller-supplied evidence wins over the provider for that type.
+    assert _evidence_seen(llm_client, "news_analyst")["AAPL"] == {"source": "caller-news"}
 
 
 class _FailingForTickerLLMClient(FakeLLMClient):
