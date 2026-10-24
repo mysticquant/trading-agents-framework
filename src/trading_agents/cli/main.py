@@ -13,6 +13,7 @@ from trading_agents.agents.analysts.fundamentals import FundamentalsAnalystAgent
 from trading_agents.agents.analysts.news import NewsAnalystAgent
 from trading_agents.agents.analysts.sentiment import SentimentAnalystAgent
 from trading_agents.agents.analysts.technical import TechnicalAnalystAgent
+from trading_agents.agents.base import Agent
 from trading_agents.agents.portfolio_manager import PortfolioManagerAgent
 from trading_agents.agents.researcher import ResearcherAgent
 from trading_agents.agents.risk_manager import RiskManagerAgent
@@ -22,33 +23,55 @@ from trading_agents.backtest.runner import BacktestRunner
 from trading_agents.brokers.paper import PaperBrokerAdapter
 from trading_agents.config.settings import Settings
 from trading_agents.contracts.backtest import BacktestResult
+from trading_agents.contracts.trading import ExecutionCosts
 from trading_agents.data.cache import CachedDataProvider, ParquetCache
 from trading_agents.data.providers.yfinance_provider import YFinanceProvider
 from trading_agents.llm.client import AnthropicLLMClient, LLMClient
+from trading_agents.llm.config import LLMRoleRegistry, RoleModelConfig
 from trading_agents.orchestration.pipeline import DecisionCycleOrchestrator
 
 
-def build_orchestrator(llm_client: LLMClient) -> DecisionCycleOrchestrator:
+def build_orchestrator(
+    llm_client: LLMClient,
+    role_registry: LLMRoleRegistry | None = None,
+    execution_costs: ExecutionCosts | None = None,
+) -> DecisionCycleOrchestrator:
+    registry = role_registry or LLMRoleRegistry()
+
+    def config(agent_cls: type[Agent]) -> RoleModelConfig:
+        return registry.for_role(agent_cls.role)
+
     return DecisionCycleOrchestrator(
-        screener=ScreenerAgent(llm_client),
-        fundamentals_analyst=FundamentalsAnalystAgent(llm_client),
-        sentiment_analyst=SentimentAnalystAgent(llm_client),
-        news_analyst=NewsAnalystAgent(llm_client),
-        technical_analyst=TechnicalAnalystAgent(llm_client),
-        researcher=ResearcherAgent(llm_client),
-        trader=TraderAgent(llm_client),
-        risk_manager=RiskManagerAgent(llm_client),
-        portfolio_manager=PortfolioManagerAgent(llm_client),
+        screener=ScreenerAgent(llm_client, config(ScreenerAgent)),
+        fundamentals_analyst=FundamentalsAnalystAgent(llm_client, config(FundamentalsAnalystAgent)),
+        sentiment_analyst=SentimentAnalystAgent(llm_client, config(SentimentAnalystAgent)),
+        news_analyst=NewsAnalystAgent(llm_client, config(NewsAnalystAgent)),
+        technical_analyst=TechnicalAnalystAgent(llm_client, config(TechnicalAnalystAgent)),
+        researcher=ResearcherAgent(llm_client, config(ResearcherAgent)),
+        trader=TraderAgent(llm_client, config(TraderAgent)),
+        risk_manager=RiskManagerAgent(llm_client, config(RiskManagerAgent)),
+        portfolio_manager=PortfolioManagerAgent(llm_client, config(PortfolioManagerAgent)),
+        execution_costs=execution_costs,
     )
 
 
 async def run_backtest(settings: Settings) -> BacktestResult:
     llm_client = AnthropicLLMClient(api_key=settings.anthropic_api_key.get_secret_value())
-    orchestrator = build_orchestrator(llm_client)
+    # One cost model shared by the broker and the agents that size buys, so
+    # cash-limited trades are sized to what the broker will actually charge.
+    execution_costs = ExecutionCosts()
+    orchestrator = build_orchestrator(
+        llm_client,
+        role_registry=LLMRoleRegistry(settings.llm_role_overrides),
+        execution_costs=execution_costs,
+    )
 
     data_provider = CachedDataProvider(YFinanceProvider(), ParquetCache(settings.data_cache_dir))
     broker = PaperBrokerAdapter(
-        initial_cash=settings.initial_cash, historical_provider=data_provider
+        initial_cash=settings.initial_cash,
+        commission_bps=execution_costs.commission_bps,
+        slippage_bps=execution_costs.slippage_bps,
+        historical_provider=data_provider,
     )
     await broker.connect()
     try:
@@ -93,6 +116,8 @@ def main() -> None:
     print(f"Win rate: {result.win_rate:.0%}")
     print(f"Trades: {len(result.trade_log)}")
     print(f"Final equity: {result.final_portfolio_state.equity:.2f}")
+    if result.cycle_errors:
+        print(f"Skipped after errors: {len(result.cycle_errors)} (see log for details)")
 
 
 if __name__ == "__main__":

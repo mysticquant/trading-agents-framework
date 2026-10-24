@@ -7,6 +7,7 @@ from trading_agents.agents.analysts.fundamentals import FundamentalsAnalystAgent
 from trading_agents.agents.analysts.news import NewsAnalystAgent
 from trading_agents.agents.analysts.sentiment import SentimentAnalystAgent
 from trading_agents.agents.analysts.technical import TechnicalAnalystAgent, TechnicalAnalystInput
+from trading_agents.indicators.technical import bars_to_frame, latest_snapshot
 from trading_agents.llm.fakes import FakeLLMClient
 
 
@@ -54,3 +55,24 @@ async def test_technical_analyst_computes_indicators_and_merges_them_into_metric
     assert report.signal == "bearish"
     assert "sma_20" in report.metrics
     assert "rsi_14" in report.metrics
+
+
+async def test_technical_analyst_llm_echo_never_overrides_computed_indicators(bars_factory):
+    bars = bars_factory("AAPL", 60)
+    computed = latest_snapshot(bars_to_frame(bars))
+    canned = AnalystLLMOutput(
+        summary="Overbought",
+        signal="bearish",
+        confidence=0.6,
+        metrics={"rsi_14": 999.0, "sma_20": -1.0, "llm_only_note": 1.0},
+    )
+    agent = TechnicalAnalystAgent(FakeLLMClient({"technical_analyst": canned}))
+
+    report = await agent.run(
+        TechnicalAnalystInput(ticker="AAPL", as_of=datetime(2024, 1, 1), bars=bars)
+    )
+
+    assert report.metrics["rsi_14"] == computed["rsi_14"]
+    assert report.metrics["sma_20"] == computed["sma_20"]
+    # Keys only the LLM supplied are still kept.
+    assert report.metrics["llm_only_note"] == 1.0

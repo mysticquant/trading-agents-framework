@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from trading_agents.agents.base import Agent
 from trading_agents.contracts.portfolio import PortfolioState
 from trading_agents.contracts.trading import (
+    ExecutionCosts,
     FinalAction,
     PortfolioDecision,
     RiskAssessment,
@@ -31,6 +32,7 @@ class PortfolioManagerInput(BaseModel):
     portfolio_state: PortfolioState
     current_prices: dict[str, float]
     as_of: datetime
+    execution_costs: ExecutionCosts = Field(default_factory=ExecutionCosts)
 
 
 class PortfolioManagerDecisionLLM(BaseModel):
@@ -94,21 +96,42 @@ class PortfolioManagerAgent(Agent[PortfolioManagerInput, list[PortfolioDecision]
 
             final_action = llm_decision.final_action
             final_quantity = min(llm_decision.final_quantity, assessment.adjusted_quantity)
+            rationale = llm_decision.rationale
+
+            # The PM may scale a proposal down or decline it, but never flip
+            # its direction: RiskManager sized (and, for buys, hard-capped)
+            # the proposal's own action, so a flipped action would execute
+            # a trade no risk check ever looked at.
+            if final_action not in (proposal.action, "hold", "reject"):
+                final_action = "reject"
+                rationale = (
+                    f"Portfolio manager returned '{llm_decision.final_action}' for a "
+                    f"'{proposal.action}' proposal; direction changes are not allowed. "
+                    f"{llm_decision.rationale}"
+                )
+            if final_action in ("hold", "reject"):
+                final_quantity = 0.0
 
             if final_action == "buy":
                 price = agent_input.current_prices[proposal.ticker]
                 # `remaining_cash` can drift a hair below zero from prior
-                # iterations' floating-point subtraction, which would
-                # otherwise make `affordable_qty` (and so `final_quantity`)
-                # a tiny negative number and fail PortfolioDecision's >= 0
-                # constraint.
-                affordable_qty = max(0.0, remaining_cash) / price if price > 0 else 0.0
+                # iterations' floating-point subtraction; `max_buy_quantity`
+                # returns 0 for non-positive cash so `final_quantity` never
+                # goes negative and fails PortfolioDecision's >= 0 constraint.
+                costs = agent_input.execution_costs
+                affordable_qty = costs.max_buy_quantity(remaining_cash, price)
+                cash_limited = final_quantity >= affordable_qty
                 final_quantity = max(0.0, min(final_quantity, affordable_qty))
                 if final_quantity <= 0:
                     final_action = "reject"
                     final_quantity = 0.0
+                elif cash_limited:
+                    # All cash is spent; zeroing it (rather than subtracting)
+                    # keeps max_buy_quantity's rounding margin from leaving
+                    # a sliver that would become a dust order for the next ticker.
+                    remaining_cash = 0.0
                 else:
-                    remaining_cash -= final_quantity * price
+                    remaining_cash -= final_quantity * costs.buy_cost_per_share(price)
 
             final_decisions.append(
                 PortfolioDecision(
@@ -116,7 +139,7 @@ class PortfolioManagerAgent(Agent[PortfolioManagerInput, list[PortfolioDecision]
                     final_action=final_action,
                     final_quantity=final_quantity,
                     approved_by="portfolio_manager",
-                    rationale=llm_decision.rationale,
+                    rationale=rationale,
                     decided_at=agent_input.as_of,
                 )
             )

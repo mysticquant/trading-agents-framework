@@ -2,7 +2,7 @@
 implementation — free, no auth, US tickers."""
 
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 
 import yfinance as yf
 
@@ -17,11 +17,12 @@ class YFinanceProvider:
     ) -> list[MarketBar]:
         # yfinance's `download` is synchronous network I/O; run it off the
         # event loop so it doesn't block other concurrent agent/data calls.
+        # Its `end` is exclusive, while this Protocol's is inclusive — hence +1 day.
         frame = await asyncio.to_thread(
             yf.download,
             ticker,
             start=start,
-            end=end,
+            end=end + timedelta(days=1),
             interval=_YFINANCE_INTERVAL[timeframe],
             progress=False,
             auto_adjust=False,

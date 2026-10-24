@@ -21,6 +21,9 @@ class TickerPipelineState:
     trade_proposal: TradeProposal | None = None
     risk_assessment: RiskAssessment | None = None
     portfolio_decision: PortfolioDecision | None = None
+    # Set when any stage of this ticker's pipeline raised; the ticker is
+    # then left out of the Portfolio Manager step for this cycle.
+    error: str | None = None
 
 
 @dataclass

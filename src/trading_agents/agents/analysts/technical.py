@@ -35,5 +35,7 @@ class TechnicalAnalystAgent(Agent[TechnicalAnalystInput, AnalystReport]):
             signal=llm_output.signal,
             confidence=llm_output.confidence,
             key_points=llm_output.key_points,
-            metrics={**indicator_values, **llm_output.metrics},
+            # Computed values go last so an LLM echo of the same key (rounded,
+            # mistyped, invented) can never replace the deterministic number.
+            metrics={**llm_output.metrics, **indicator_values},
         )

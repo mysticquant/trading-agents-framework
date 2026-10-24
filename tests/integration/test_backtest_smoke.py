@@ -113,3 +113,51 @@ async def test_backtest_runner_produces_a_sane_result():
     assert len(result.trade_log) > 0
     assert result.final_portfolio_state.equity > 0
     assert result.ticker_universe == ["AAPL"]
+    assert result.cycle_errors == []
+
+
+class _ScreenerFailsOnceLLMClient(FakeLLMClient):
+    """The screener call on the Nth cycle raises, as a rate-limit error
+    surviving the SDK's retries would."""
+
+    def __init__(self, responses, *, fail_on_call: int) -> None:
+        super().__init__(responses)
+        self._fail_on_call = fail_on_call
+        self._screener_calls = 0
+
+    async def generate_structured(self, **kwargs):
+        if kwargs["role"] == "screener":
+            self._screener_calls += 1
+            if self._screener_calls == self._fail_on_call:
+                raise RuntimeError("simulated rate limit")
+        return await super().generate_structured(**kwargs)
+
+
+async def test_backtest_survives_a_failed_decision_cycle():
+    llm_client = _ScreenerFailsOnceLLMClient(_canned_responses(), fail_on_call=3)
+    orchestrator = DecisionCycleOrchestrator(
+        screener=ScreenerAgent(llm_client),
+        fundamentals_analyst=FundamentalsAnalystAgent(llm_client),
+        sentiment_analyst=SentimentAnalystAgent(llm_client),
+        news_analyst=NewsAnalystAgent(llm_client),
+        technical_analyst=TechnicalAnalystAgent(llm_client),
+        researcher=ResearcherAgent(llm_client),
+        trader=TraderAgent(llm_client),
+        risk_manager=RiskManagerAgent(llm_client),
+        portfolio_manager=PortfolioManagerAgent(llm_client),
+    )
+    data_provider = _SyntheticDataProvider()
+    broker = PaperBrokerAdapter(initial_cash=100_000.0, historical_provider=data_provider)
+    await broker.connect()
+
+    runner = BacktestRunner(orchestrator=orchestrator, broker=broker, data_provider=data_provider)
+    result = await runner.run(
+        start_date=date(2024, 1, 1), end_date=date(2024, 1, 10), universe=["AAPL"]
+    )
+
+    # Every day still gets an equity point; only the failed day is skipped.
+    assert len(result.equity_curve) == 10
+    assert len(result.cycle_errors) == 1
+    assert result.cycle_errors[0].startswith("2024-01-03")
+    assert "simulated rate limit" in result.cycle_errors[0]
+    assert len(result.trade_log) == 9

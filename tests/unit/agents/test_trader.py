@@ -1,9 +1,12 @@
 from datetime import datetime
 
+import pytest
+
 from trading_agents.agents.trader import TraderAgent, TraderInput, TraderLLMOutput
 from trading_agents.contracts.analysis import ResearchDebateResult
 from trading_agents.contracts.broker import Position
 from trading_agents.contracts.portfolio import PortfolioState
+from trading_agents.contracts.trading import ExecutionCosts
 from trading_agents.llm.fakes import FakeLLMClient
 
 
@@ -33,10 +36,11 @@ async def test_trader_caps_buy_quantity_to_available_cash():
             research=_research(),
             portfolio_state=portfolio_state,
             current_price=100.0,
+            execution_costs=ExecutionCosts(commission_bps=0.0, slippage_bps=0.0),
         )
     )
 
-    assert proposal.quantity == 10.0
+    assert proposal.quantity == pytest.approx(10.0)
 
 
 async def test_trader_caps_sell_quantity_to_held_position():
@@ -84,3 +88,27 @@ async def test_trader_hold_action_always_has_zero_quantity():
 
     assert proposal.action == "hold"
     assert proposal.quantity == 0.0
+
+
+async def test_trader_buy_capped_to_cash_is_affordable_after_fees():
+    canned = TraderLLMOutput(
+        action="buy", quantity=1000.0, order_type="market", rationale="go", time_horizon="1w"
+    )
+    agent = TraderAgent(FakeLLMClient({"trader": canned}))
+    costs = ExecutionCosts(commission_bps=5.0, slippage_bps=5.0)
+    portfolio_state = PortfolioState(
+        cash=1_000.0, equity=1_000.0, realized_pnl=0.0, as_of=datetime(2024, 1, 1)
+    )
+
+    proposal = await agent.run(
+        TraderInput(
+            ticker="AAPL",
+            research=_research(),
+            portfolio_state=portfolio_state,
+            current_price=100.0,
+            execution_costs=costs,
+        )
+    )
+
+    assert proposal.quantity * costs.buy_cost_per_share(100.0) <= 1_000.0
+    assert proposal.quantity == pytest.approx(10.0 / (1.0005 * 1.0005))

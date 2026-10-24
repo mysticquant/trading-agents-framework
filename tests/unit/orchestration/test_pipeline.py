@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 import pytest
@@ -60,8 +61,9 @@ def canned_responses():
     }
 
 
-def _build_orchestrator(llm_client) -> DecisionCycleOrchestrator:
+def _build_orchestrator(llm_client, **kwargs) -> DecisionCycleOrchestrator:
     return DecisionCycleOrchestrator(
+        **kwargs,
         screener=ScreenerAgent(llm_client),
         fundamentals_analyst=FundamentalsAnalystAgent(llm_client),
         sentiment_analyst=SentimentAnalystAgent(llm_client),
@@ -126,3 +128,102 @@ async def test_run_cycle_excludes_tickers_the_prefilter_never_saw(bars_factory, 
     )
 
     assert state.per_ticker == {}
+
+
+def _researcher_calls(llm_client: FakeLLMClient) -> list[str]:
+    return [
+        json.loads(call["user_content"])["ticker"]
+        for call in llm_client.calls
+        if call["role"] == "researcher"
+    ]
+
+
+async def test_run_cycle_runs_each_ticker_once_even_if_the_screener_repeats_it(
+    bars_factory, canned_responses
+):
+    canned_responses["screener"] = ScreenerLLMOutput(
+        rankings=[
+            ScreenerRanking(ticker="AAPL", score=0.9, rationale="a"),
+            ScreenerRanking(ticker="MSFT", score=0.8, rationale="b"),
+            ScreenerRanking(ticker="AAPL", score=0.7, rationale="again"),
+            ScreenerRanking(ticker="AAPL", score=0.6, rationale="and again"),
+        ]
+    )
+    llm_client = FakeLLMClient(canned_responses)
+    orchestrator = _build_orchestrator(llm_client)
+
+    state = await orchestrator.run_cycle(
+        as_of=datetime(2024, 1, 1),
+        universe=["AAPL", "MSFT"],
+        market_data={
+            "AAPL": bars_factory("AAPL", 60),
+            "MSFT": bars_factory("MSFT", 60, start_price=200.0),
+        },
+        portfolio_state=PortfolioState(
+            cash=100_000.0, equity=100_000.0, realized_pnl=0.0, as_of=datetime(2024, 1, 1)
+        ),
+    )
+
+    assert sorted(_researcher_calls(llm_client)) == ["AAPL", "MSFT"]
+    assert set(state.per_ticker) == {"AAPL", "MSFT"}
+
+
+async def test_run_cycle_caps_the_shortlist_at_screener_top_n(bars_factory, canned_responses):
+    llm_client = FakeLLMClient(canned_responses)
+    orchestrator = _build_orchestrator(llm_client, screener_top_n=1)
+
+    await orchestrator.run_cycle(
+        as_of=datetime(2024, 1, 1),
+        universe=["AAPL", "MSFT"],
+        market_data={
+            "AAPL": bars_factory("AAPL", 60),
+            "MSFT": bars_factory("MSFT", 60, start_price=200.0),
+        },
+        portfolio_state=PortfolioState(
+            cash=100_000.0, equity=100_000.0, realized_pnl=0.0, as_of=datetime(2024, 1, 1)
+        ),
+    )
+
+    assert len(_researcher_calls(llm_client)) == 1
+
+
+class _FailingForTickerLLMClient(FakeLLMClient):
+    """Raises for one (role, ticker) pair, standing in for an API error or
+    an LLM output that fails validation."""
+
+    def __init__(self, responses, *, role: str, ticker: str) -> None:
+        super().__init__(responses)
+        self._fail_role = role
+        self._fail_ticker = ticker
+
+    async def generate_structured(self, **kwargs):
+        if kwargs["role"] == self._fail_role and (
+            json.loads(kwargs["user_content"]).get("ticker") == self._fail_ticker
+        ):
+            raise RuntimeError("simulated LLM failure")
+        return await super().generate_structured(**kwargs)
+
+
+async def test_one_failing_ticker_does_not_abort_the_cycle(bars_factory, canned_responses):
+    llm_client = _FailingForTickerLLMClient(canned_responses, role="researcher", ticker="MSFT")
+    orchestrator = _build_orchestrator(llm_client)
+
+    state = await orchestrator.run_cycle(
+        as_of=datetime(2024, 1, 1),
+        universe=["AAPL", "MSFT"],
+        market_data={
+            "AAPL": bars_factory("AAPL", 60),
+            "MSFT": bars_factory("MSFT", 60, start_price=200.0),
+        },
+        portfolio_state=PortfolioState(
+            cash=100_000.0, equity=100_000.0, realized_pnl=0.0, as_of=datetime(2024, 1, 1)
+        ),
+    )
+
+    msft = state.per_ticker["MSFT"]
+    assert msft.error is not None and "simulated LLM failure" in msft.error
+    assert msft.portfolio_decision is None
+    aapl = state.per_ticker["AAPL"]
+    assert aapl.error is None
+    assert aapl.portfolio_decision is not None
+    assert aapl.portfolio_decision.final_action == "buy"
