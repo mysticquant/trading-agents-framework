@@ -25,3 +25,7 @@ class BacktestResult(BaseModel):
     max_drawdown_pct: float
     win_rate: float
     final_portfolio_state: PortfolioState
+    # One line per failed decision cycle or per-ticker pipeline, e.g.
+    # "2024-03-01 AAPL: RateLimitError: ...". Failures are isolated so the
+    # run continues; this records what was skipped.
+    cycle_errors: list[str] = Field(default_factory=list)

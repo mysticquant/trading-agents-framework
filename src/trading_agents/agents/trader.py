@@ -13,7 +13,12 @@ from trading_agents.agents.base import Agent
 from trading_agents.contracts.analysis import ResearchDebateResult
 from trading_agents.contracts.broker import Position
 from trading_agents.contracts.portfolio import PortfolioState
-from trading_agents.contracts.trading import OrderType, TradeAction, TradeProposal
+from trading_agents.contracts.trading import (
+    ExecutionCosts,
+    OrderType,
+    TradeAction,
+    TradeProposal,
+)
 
 
 class TraderInput(BaseModel):
@@ -22,6 +27,7 @@ class TraderInput(BaseModel):
     portfolio_state: PortfolioState
     current_position: Position | None = None
     current_price: float
+    execution_costs: ExecutionCosts = Field(default_factory=ExecutionCosts)
 
 
 class TraderLLMOutput(BaseModel):
@@ -54,7 +60,9 @@ class TraderAgent(Agent[TraderInput, TradeProposal]):
 
         quantity = llm_output.quantity
         if llm_output.action == "buy" and agent_input.current_price > 0:
-            max_affordable = agent_input.portfolio_state.cash / agent_input.current_price
+            max_affordable = agent_input.execution_costs.max_buy_quantity(
+                agent_input.portfolio_state.cash, agent_input.current_price
+            )
             quantity = min(quantity, max_affordable)
         elif llm_output.action == "sell":
             held = agent_input.current_position.quantity if agent_input.current_position else 0.0

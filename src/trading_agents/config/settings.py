@@ -4,9 +4,10 @@ via plain constructor arguments (no global singleton)."""
 import json
 from datetime import date
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -14,7 +15,11 @@ class Settings(BaseSettings):
 
     anthropic_api_key: SecretStr
 
-    ticker_universe: list[str] = Field(default_factory=lambda: ["AAPL", "MSFT", "GOOGL"])
+    # `NoDecode` stops pydantic-settings from JSON-decoding the raw env value
+    # before `_split_csv` sees it, so the documented `AAPL,MSFT,GOOGL` form works.
+    ticker_universe: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["AAPL", "MSFT", "GOOGL"]
+    )
     backtest_start_date: date = date(2024, 1, 1)
     backtest_end_date: date = date(2024, 6, 1)
     initial_cash: float = 100_000.0
@@ -27,6 +32,8 @@ class Settings(BaseSettings):
     @classmethod
     def _split_csv(cls, value: object) -> object:
         if isinstance(value, str):
+            if value.strip().startswith("["):
+                return json.loads(value)
             return [ticker.strip() for ticker in value.split(",") if ticker.strip()]
         return value
 

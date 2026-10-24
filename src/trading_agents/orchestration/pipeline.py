@@ -15,6 +15,7 @@ human-in-the-loop branching.
 """
 
 import asyncio
+import logging
 import uuid
 from datetime import datetime
 
@@ -38,8 +39,11 @@ from trading_agents.agents.screener import (
 from trading_agents.agents.trader import TraderAgent, TraderInput
 from trading_agents.contracts.market import MarketBar
 from trading_agents.contracts.portfolio import PortfolioState
+from trading_agents.contracts.trading import ExecutionCosts
 from trading_agents.indicators.technical import bars_to_frame
 from trading_agents.orchestration.state import DecisionCycleState, TickerPipelineState
+
+logger = logging.getLogger(__name__)
 
 
 class DecisionCycleOrchestrator:
@@ -56,9 +60,13 @@ class DecisionCycleOrchestrator:
         risk_manager: RiskManagerAgent,
         portfolio_manager: PortfolioManagerAgent,
         risk_config: RiskConfig | None = None,
+        execution_costs: ExecutionCosts | None = None,
         screener_top_n: int = 10,
         max_concurrent_tickers: int = 5,
     ) -> None:
+        """`execution_costs` should match the broker the decisions are
+        submitted to, so cash-limited buys are sized to what the broker
+        will actually charge."""
         self.screener = screener
         self.fundamentals_analyst = fundamentals_analyst
         self.sentiment_analyst = sentiment_analyst
@@ -69,6 +77,7 @@ class DecisionCycleOrchestrator:
         self.risk_manager = risk_manager
         self.portfolio_manager = portfolio_manager
         self.risk_config = risk_config or RiskConfig()
+        self.execution_costs = execution_costs or ExecutionCosts()
         self.screener_top_n = screener_top_n
         self._ticker_semaphore = asyncio.Semaphore(max_concurrent_tickers)
 
@@ -108,10 +117,14 @@ class DecisionCycleOrchestrator:
         # Guard against the LLM naming a ticker outside what it was given:
         # only candidates that passed the deterministic pre-filter (and
         # therefore have enough history for the technical analyst) proceed.
+        # Repeats are dropped (keeping rank order) and the list is capped at
+        # `screener_top_n`, so the LLM can't multiply per-ticker pipelines.
         valid_tickers = {candidate.ticker for candidate in candidates}
-        shortlist = [
-            result.ticker for result in state.screen_results if result.ticker in valid_tickers
-        ]
+        shortlist = list(
+            dict.fromkeys(
+                result.ticker for result in state.screen_results if result.ticker in valid_tickers
+            )
+        )[: self.screener_top_n]
 
         ticker_states = await asyncio.gather(
             *(
@@ -133,7 +146,7 @@ class DecisionCycleOrchestrator:
         pairs = [
             ProposalAssessmentPair(proposal=ts.trade_proposal, assessment=ts.risk_assessment)
             for ts in ticker_states
-            if ts.trade_proposal is not None and ts.risk_assessment is not None
+            if ts.error is None and ts.trade_proposal is not None and ts.risk_assessment is not None
         ]
         current_prices = {
             ticker: market_data[ticker][-1].close for ticker in shortlist if market_data.get(ticker)
@@ -144,6 +157,7 @@ class DecisionCycleOrchestrator:
                 portfolio_state=portfolio_state,
                 current_prices=current_prices,
                 as_of=as_of,
+                execution_costs=self.execution_costs,
             )
         )
         for decision in decisions:
@@ -164,60 +178,86 @@ class DecisionCycleOrchestrator:
     ) -> TickerPipelineState:
         async with self._ticker_semaphore:
             ticker_state = TickerPipelineState(ticker=ticker)
-
-            (
-                fundamentals_report,
-                sentiment_report,
-                news_report,
-                technical_report,
-            ) = await asyncio.gather(
-                self.fundamentals_analyst.run(
-                    AnalystInput(ticker=ticker, as_of=as_of, evidence=fundamentals_evidence)
-                ),
-                self.sentiment_analyst.run(
-                    AnalystInput(ticker=ticker, as_of=as_of, evidence=sentiment_evidence)
-                ),
-                self.news_analyst.run(
-                    AnalystInput(ticker=ticker, as_of=as_of, evidence=news_evidence)
-                ),
-                self.technical_analyst.run(
-                    TechnicalAnalystInput(ticker=ticker, as_of=as_of, bars=bars)
-                ),
-            )
-            ticker_state.analyst_reports = [
-                fundamentals_report,
-                sentiment_report,
-                news_report,
-                technical_report,
-            ]
-
-            research = await self.researcher.run(
-                ResearcherInput(ticker=ticker, analyst_reports=ticker_state.analyst_reports)
-            )
-            ticker_state.research = research
-
-            current_price = bars[-1].close if bars else 0.0
-            current_position = portfolio_state.positions.get(ticker)
-
-            trade_proposal = await self.trader.run(
-                TraderInput(
-                    ticker=ticker,
-                    research=research,
+            # One failed LLM call (API error after retries, an output that
+            # fails validation, ...) costs this ticker for this cycle only —
+            # it must not abort the other tickers or the whole backtest.
+            try:
+                await self._run_ticker_stages(
+                    ticker_state,
+                    as_of=as_of,
+                    bars=bars,
                     portfolio_state=portfolio_state,
-                    current_position=current_position,
-                    current_price=current_price,
+                    fundamentals_evidence=fundamentals_evidence,
+                    sentiment_evidence=sentiment_evidence,
+                    news_evidence=news_evidence,
                 )
-            )
-            ticker_state.trade_proposal = trade_proposal
-
-            risk_assessment = await self.risk_manager.run(
-                RiskManagerInput(
-                    proposal=trade_proposal,
-                    portfolio_state=portfolio_state,
-                    current_price=current_price,
-                    risk_config=self.risk_config,
-                )
-            )
-            ticker_state.risk_assessment = risk_assessment
-
+            except Exception as exc:
+                logger.exception("Ticker pipeline failed for %s at %s", ticker, as_of)
+                ticker_state.error = f"{type(exc).__name__}: {exc}"
             return ticker_state
+
+    async def _run_ticker_stages(
+        self,
+        ticker_state: TickerPipelineState,
+        *,
+        as_of: datetime,
+        bars: list[MarketBar],
+        portfolio_state: PortfolioState,
+        fundamentals_evidence: dict[str, object],
+        sentiment_evidence: dict[str, object],
+        news_evidence: dict[str, object],
+    ) -> None:
+        ticker = ticker_state.ticker
+        (
+            fundamentals_report,
+            sentiment_report,
+            news_report,
+            technical_report,
+        ) = await asyncio.gather(
+            self.fundamentals_analyst.run(
+                AnalystInput(ticker=ticker, as_of=as_of, evidence=fundamentals_evidence)
+            ),
+            self.sentiment_analyst.run(
+                AnalystInput(ticker=ticker, as_of=as_of, evidence=sentiment_evidence)
+            ),
+            self.news_analyst.run(AnalystInput(ticker=ticker, as_of=as_of, evidence=news_evidence)),
+            self.technical_analyst.run(
+                TechnicalAnalystInput(ticker=ticker, as_of=as_of, bars=bars)
+            ),
+        )
+        ticker_state.analyst_reports = [
+            fundamentals_report,
+            sentiment_report,
+            news_report,
+            technical_report,
+        ]
+
+        research = await self.researcher.run(
+            ResearcherInput(ticker=ticker, analyst_reports=ticker_state.analyst_reports)
+        )
+        ticker_state.research = research
+
+        current_price = bars[-1].close if bars else 0.0
+        current_position = portfolio_state.positions.get(ticker)
+
+        trade_proposal = await self.trader.run(
+            TraderInput(
+                ticker=ticker,
+                research=research,
+                portfolio_state=portfolio_state,
+                current_position=current_position,
+                current_price=current_price,
+                execution_costs=self.execution_costs,
+            )
+        )
+        ticker_state.trade_proposal = trade_proposal
+
+        risk_assessment = await self.risk_manager.run(
+            RiskManagerInput(
+                proposal=trade_proposal,
+                portfolio_state=portfolio_state,
+                current_price=current_price,
+                risk_config=self.risk_config,
+            )
+        )
+        ticker_state.risk_assessment = risk_assessment

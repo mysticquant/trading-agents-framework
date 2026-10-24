@@ -58,14 +58,21 @@ class RiskManagerAgent(Agent[RiskManagerInput, RiskAssessment]):
         risk_flags = list(llm_output.risk_flags)
         if proposal.action == "buy" and agent_input.current_price > 0:
             max_allowed_pct = min(llm_output.max_position_size_pct, hard_cap_pct)
-            max_allowed_qty = (
-                agent_input.portfolio_state.equity * max_allowed_pct
-            ) / agent_input.current_price
+            # The limit bounds the *total* position, so shares already held
+            # use up part of it — otherwise a buy every cycle would let the
+            # position grow by a full cap's worth each day.
+            existing = agent_input.portfolio_state.positions.get(proposal.ticker)
+            existing_value = existing.quantity * agent_input.current_price if existing else 0.0
+            headroom_value = max(
+                0.0, agent_input.portfolio_state.equity * max_allowed_pct - existing_value
+            )
+            max_allowed_qty = headroom_value / agent_input.current_price
             final_quantity = min(llm_output.adjusted_quantity, proposal.quantity, max_allowed_qty)
             if final_quantity < min(llm_output.adjusted_quantity, proposal.quantity):
                 risk_flags.append(
                     f"Quantity trimmed to {final_quantity:g} by the "
-                    f"{hard_cap_pct:.0%} max-position-per-ticker hard limit."
+                    f"{max_allowed_pct:.0%} max-position-per-ticker limit "
+                    f"(existing position: {existing_value:,.2f})."
                 )
         else:
             max_allowed_pct = llm_output.max_position_size_pct

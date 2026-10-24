@@ -9,6 +9,7 @@ broker instance across many backtest or trading sessions.
 """
 
 import asyncio
+import logging
 from datetime import date, datetime, time, timedelta
 
 from trading_agents.backtest import metrics
@@ -19,6 +20,8 @@ from trading_agents.contracts.broker import Order, OrderRequest
 from trading_agents.contracts.portfolio import PortfolioState
 from trading_agents.data.providers.base import HistoricalDataProvider
 from trading_agents.orchestration.pipeline import DecisionCycleOrchestrator
+
+logger = logging.getLogger(__name__)
 
 
 class BacktestRunner:
@@ -64,6 +67,7 @@ class BacktestRunner:
 
         equity_curve: list[EquityCurvePoint] = []
         trade_log: list[Order] = []
+        cycle_errors: list[str] = []
 
         for day in trading_days:
             as_of = datetime.combine(day, time.min)
@@ -77,14 +81,25 @@ class BacktestRunner:
                     self.broker.mark_price(ticker, bars[-1].close)
 
             portfolio_state = await self._portfolio_state(as_of)
-            cycle_state = await self.orchestrator.run_cycle(
-                as_of=as_of,
-                universe=universe,
-                market_data=market_data_window,
-                portfolio_state=portfolio_state,
-            )
+            # A cycle-level failure (screener or portfolio manager call)
+            # skips trading for this day only; the equity point is still
+            # recorded so the curve stays continuous.
+            try:
+                cycle_state = await self.orchestrator.run_cycle(
+                    as_of=as_of,
+                    universe=universe,
+                    market_data=market_data_window,
+                    portfolio_state=portfolio_state,
+                )
+            except Exception as exc:
+                logger.exception("Decision cycle failed for %s", day)
+                cycle_errors.append(f"{day}: {type(exc).__name__}: {exc}")
+                cycle_state = None
 
-            for ticker_state in cycle_state.per_ticker.values():
+            ticker_states = cycle_state.per_ticker.values() if cycle_state else ()
+            for ticker_state in ticker_states:
+                if ticker_state.error is not None:
+                    cycle_errors.append(f"{day} {ticker_state.ticker}: {ticker_state.error}")
                 decision = ticker_state.portfolio_decision
                 if (
                     decision is None
@@ -102,10 +117,12 @@ class BacktestRunner:
                         )
                     )
                     trade_log.append(order)
-                except OrderRejectedError:
-                    # Safety net only: the Portfolio Manager already enforces
-                    # cash feasibility, but slippage/commission on fill can
-                    # still push a trade just over the edge.
+                except OrderRejectedError as exc:
+                    # Safety net only: the Portfolio Manager already sizes
+                    # buys to cash including slippage/commission, so this
+                    # should only fire if the orchestrator's execution costs
+                    # don't match the broker's.
+                    logger.warning("Order rejected for %s on %s: %s", decision.ticker, day, exc)
                     continue
 
             balance = await self.broker.get_account_balance()
@@ -126,6 +143,7 @@ class BacktestRunner:
             max_drawdown_pct=metrics.max_drawdown_pct(equity_curve),
             win_rate=metrics.win_rate(trade_log),
             final_portfolio_state=final_portfolio_state,
+            cycle_errors=cycle_errors,
         )
 
     async def _portfolio_state(self, as_of: datetime) -> PortfolioState:

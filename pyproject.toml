@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "anthropic>=1.0",
     "pydantic>=2.9",
-    "pydantic-settings>=2.5",
+    "pydantic-settings>=2.7",
     "pandas>=2.2",
     "pyarrow>=17.0",
     "yfinance>=0.2.40",
