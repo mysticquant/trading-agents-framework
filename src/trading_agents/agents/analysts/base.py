@@ -5,11 +5,10 @@ their prompt file. The TechnicalAnalyst is NOT built on this base: it
 computes its own evidence deterministically from price bars rather than
 receiving a pre-built evidence dict (see `agents/analysts/technical.py`).
 
-Phase 1 has no dedicated fundamentals/sentiment/news data provider yet
-(only OHLCV via `YFinanceProvider` is in scope) — callers assemble
-`AnalystInput.evidence` from whatever source they have. Wiring up real data
-sources for these three is future work; the agent logic itself is complete
-and independently testable today via `FakeLLMClient`.
+Evidence is assembled outside the agent — normally by an
+`EvidenceProvider` (see `data/evidence/`) that keeps it point-in-time for
+backtests — so the agent logic stays independently testable via
+`FakeLLMClient`.
 """
 
 import json

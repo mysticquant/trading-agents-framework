@@ -4,9 +4,11 @@ indicators -> paper broker) without needing an Anthropic API key, by wiring
 
 This does NOT test agent *reasoning* quality — the LLM responses are
 scripted — but it validates everything else: data ingestion/caching, the
+point-in-time analyst evidence (fundamentals, analyst actions, news), the
 orchestrator's wiring and concurrency, indicator computation, and the paper
 broker's fills, over real historical prices. Needs internet access (to
-Yahoo Finance via yfinance), but no Claude API key.
+Yahoo Finance via yfinance), but no Claude API key. Set SEC_USER_AGENT
+(e.g. "Jane Doe jane@example.com") to also pull SEC EDGAR filings.
 
 Run from the project root after `pip install -e ".[dev]"`:
 
@@ -14,6 +16,7 @@ Run from the project root after `pip install -e ".[dev]"`:
 """
 
 import asyncio
+import os
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -34,6 +37,9 @@ from trading_agents.agents.trader import TraderAgent, TraderLLMOutput
 from trading_agents.backtest.runner import BacktestRunner
 from trading_agents.brokers.paper import PaperBrokerAdapter
 from trading_agents.data.cache import CachedDataProvider, ParquetCache
+from trading_agents.data.evidence.provider import DefaultEvidenceProvider
+from trading_agents.data.evidence.sec_edgar import SecEdgarFilingsSource
+from trading_agents.data.evidence.yfinance_source import YFinanceMarketDataSource
 from trading_agents.data.providers.yfinance_provider import YFinanceProvider
 from trading_agents.llm.fakes import FakeLLMClient
 from trading_agents.orchestration.pipeline import DecisionCycleOrchestrator
@@ -100,6 +106,11 @@ def build_canned_responses(universe: list[str]) -> dict:
 
 async def main() -> None:
     llm_client = FakeLLMClient(build_canned_responses(UNIVERSE))
+    sec_user_agent = os.environ.get("SEC_USER_AGENT")
+    evidence_provider = DefaultEvidenceProvider(
+        YFinanceMarketDataSource(),
+        SecEdgarFilingsSource(sec_user_agent) if sec_user_agent else None,
+    )
     orchestrator = DecisionCycleOrchestrator(
         screener=ScreenerAgent(llm_client),
         fundamentals_analyst=FundamentalsAnalystAgent(llm_client),
@@ -110,6 +121,7 @@ async def main() -> None:
         trader=TraderAgent(llm_client),
         risk_manager=RiskManagerAgent(llm_client),
         portfolio_manager=PortfolioManagerAgent(llm_client),
+        evidence_provider=evidence_provider,
     )
 
     data_provider = CachedDataProvider(YFinanceProvider(), ParquetCache(Path("data/cache")))
@@ -131,6 +143,9 @@ async def main() -> None:
     print(f"Max drawdown: {result.max_drawdown_pct:.2f}%")
     print(f"Win rate: {result.win_rate:.0%}")
     print(f"Final equity: {result.final_portfolio_state.equity:.2f}")
+    print(f"SEC filings: {'on' if sec_user_agent else 'off (set SEC_USER_AGENT to enable)'}")
+    if result.cycle_errors:
+        print(f"Skipped after errors: {len(result.cycle_errors)}")
 
     await broker.disconnect()
 

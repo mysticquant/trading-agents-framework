@@ -40,6 +40,7 @@ from trading_agents.agents.trader import TraderAgent, TraderInput
 from trading_agents.contracts.market import MarketBar
 from trading_agents.contracts.portfolio import PortfolioState
 from trading_agents.contracts.trading import ExecutionCosts
+from trading_agents.data.evidence.base import EvidenceProvider
 from trading_agents.indicators.technical import bars_to_frame
 from trading_agents.orchestration.state import DecisionCycleState, TickerPipelineState
 
@@ -61,12 +62,16 @@ class DecisionCycleOrchestrator:
         portfolio_manager: PortfolioManagerAgent,
         risk_config: RiskConfig | None = None,
         execution_costs: ExecutionCosts | None = None,
+        evidence_provider: EvidenceProvider | None = None,
         screener_top_n: int = 10,
         max_concurrent_tickers: int = 5,
     ) -> None:
         """`execution_costs` should match the broker the decisions are
         submitted to, so cash-limited buys are sized to what the broker
-        will actually charge."""
+        will actually charge. `evidence_provider`, when given, supplies
+        point-in-time fundamentals/sentiment/news evidence for each
+        shortlisted ticker; without one those analysts see empty evidence
+        unless the caller passes it to `run_cycle`."""
         self.screener = screener
         self.fundamentals_analyst = fundamentals_analyst
         self.sentiment_analyst = sentiment_analyst
@@ -78,6 +83,7 @@ class DecisionCycleOrchestrator:
         self.portfolio_manager = portfolio_manager
         self.risk_config = risk_config or RiskConfig()
         self.execution_costs = execution_costs or ExecutionCosts()
+        self.evidence_provider = evidence_provider
         self.screener_top_n = screener_top_n
         self._ticker_semaphore = asyncio.Semaphore(max_concurrent_tickers)
 
@@ -92,10 +98,10 @@ class DecisionCycleOrchestrator:
         sentiment_evidence: dict[str, dict[str, object]] | None = None,
         news_evidence: dict[str, dict[str, object]] | None = None,
     ) -> DecisionCycleState:
-        """Evidence dicts are optional and default to empty per ticker —
-        Phase 1 has no dedicated fundamentals/sentiment/news data source
-        yet (see `agents/analysts/base.py`); callers that have one can pass
-        it here without any other change to this method."""
+        """Evidence dicts are optional, keyed by ticker. For each ticker and
+        evidence type, a caller-supplied dict takes precedence; otherwise
+        the orchestrator's `evidence_provider` (if any) fills it in, and
+        failing that it stays empty."""
         fundamentals_evidence = fundamentals_evidence or {}
         sentiment_evidence = sentiment_evidence or {}
         news_evidence = news_evidence or {}
@@ -208,6 +214,15 @@ class DecisionCycleOrchestrator:
         news_evidence: dict[str, object],
     ) -> None:
         ticker = ticker_state.ticker
+        if (
+            self.evidence_provider is not None
+            and bars
+            and not (fundamentals_evidence and sentiment_evidence and news_evidence)
+        ):
+            bundle = await self.evidence_provider.get_evidence(ticker, as_of, bars[-1].close)
+            fundamentals_evidence = fundamentals_evidence or bundle.fundamentals
+            sentiment_evidence = sentiment_evidence or bundle.sentiment
+            news_evidence = news_evidence or bundle.news
         (
             fundamentals_report,
             sentiment_report,
