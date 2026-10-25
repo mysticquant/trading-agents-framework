@@ -19,13 +19,19 @@ Behavior worth knowing:
   `get_order_status` for the fill.
 - Only US stocks (`Stock(symbol, "SMART", "USD")` by default) are mapped;
   other position types are left out of `get_positions`.
+- Historical bars need market-data permissions on the account (a paper
+  account can share the live account's subscriptions). Requests are sent
+  one at a time to stay inside IB's historical-data pacing limits, and a
+  range that includes today is requested "up to now".
 """
 
 import asyncio
 import math
+from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ib_async import IB, LimitOrder, MarketOrder, Stock, Trade
 from ib_async import Order as IBOrder
@@ -42,6 +48,9 @@ from trading_agents.contracts.broker import (
 from trading_agents.contracts.market import MarketBar, Timeframe
 
 _BAR_SIZES: dict[str, str] = {"1d": "1 day", "1h": "1 hour", "5m": "5 mins"}
+# US equities trade on New York time; historical request bounds are given
+# explicitly in it, rather than in whatever timezone TWS is logged in with.
+_EXCHANGE_TZ = ZoneInfo("America/New_York")
 _REJECTED_STATES = {IBOrderStatus.Inactive}
 _CANCELLED_STATES = {IBOrderStatus.Cancelled, IBOrderStatus.ApiCancelled}
 # Not yet acknowledged by IB. (ib_async's WaitingStates also includes
@@ -123,8 +132,10 @@ class InteractiveBrokersAdapter:
         connect_timeout_seconds: float = 10.0,
         order_ack_timeout_seconds: float = 10.0,
         ib: Any = None,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
-        """`ib` is injectable for tests; by default a fresh `ib_async.IB`."""
+        """`ib` (and `now`) are injectable for tests; by default a fresh
+        `ib_async.IB`."""
         self._ib = ib if ib is not None else IB()
         self._host = host
         self._port = port
@@ -138,6 +149,8 @@ class InteractiveBrokersAdapter:
         self._ack_timeout = order_ack_timeout_seconds
         self._contracts: dict[str, Any] = {}
         self._trades: dict[str, Trade] = {}
+        self._now = now
+        self._history_lock = asyncio.Lock()
 
     @property
     def account(self) -> str:
@@ -250,14 +263,31 @@ class InteractiveBrokersAdapter:
     ) -> list[MarketBar]:
         self._require_connection()
         contract = await self._contract(ticker)
-        bars = await self._ib.reqHistoricalDataAsync(
-            contract,
-            endDateTime=datetime.combine(end + timedelta(days=1), time.min),
-            durationStr=duration_for(start, end),
-            barSizeSetting=_BAR_SIZES[timeframe],
-            whatToShow="TRADES",
-            useRTH=True,
+        today = self._now().astimezone(_EXCHANGE_TZ).date()
+        # IB rejects an end in the future, so a range reaching today asks for
+        # "up to now" (""), which also returns today's bar so far.
+        end_at: datetime | str = (
+            ""
+            if end >= today
+            else datetime.combine(end + timedelta(days=1), time.min, tzinfo=_EXCHANGE_TZ)
         )
+        async with self._history_lock:
+            bars = await self._ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime=end_at,
+                durationStr=duration_for(start, min(end, today)),
+                barSizeSetting=_BAR_SIZES[timeframe],
+                whatToShow="TRADES",
+                useRTH=True,
+            )
+        if not bars:
+            # IB answers a request it can't serve (no market-data permissions,
+            # pacing violation, unknown range) with no bars plus an error event.
+            raise BrokerError(
+                f"IB returned no {timeframe} bars for {ticker} ({start} to {end}). Check "
+                "the account's market-data permissions (paper accounts must be set to "
+                "share the live account's), or set IB_MARKET_DATA=yfinance."
+            )
         result = []
         for bar in bars:
             timestamp = (
@@ -278,6 +308,13 @@ class InteractiveBrokersAdapter:
                 )
             )
         return result
+
+    async def get_bars(
+        self, ticker: str, start: date, end: date, timeframe: Timeframe
+    ) -> list[MarketBar]:
+        """`HistoricalDataProvider` view of `get_historical_bars`, so the
+        adapter can also be the live loop's market-data source."""
+        return await self.get_historical_bars(ticker, start, end, timeframe)
 
     async def place_order(self, request: OrderRequest) -> Order:
         self._require_connection()

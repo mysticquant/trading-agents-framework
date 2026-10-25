@@ -82,6 +82,9 @@ def build_live_broker(
             readonly=mode == "dry-run",
             allow_live=mode in ("dry-run", "live"),
         )
+        if settings.ib_market_data == "ib":
+            # Decide on the same prices IB will fill at.
+            return broker, broker
         data = CachedDataProvider(YFinanceProvider(), ParquetCache(settings.data_cache_dir))
         return broker, data
 

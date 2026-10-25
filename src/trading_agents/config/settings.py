@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     ib_port: int = 7497
     ib_client_id: int = 1
     ib_account: str = ""
+    # Price bars for the IB live loop: from IB itself (needs market-data
+    # permissions) or from yfinance.
+    ib_market_data: Literal["ib", "yfinance"] = "ib"
 
     # Zerodha Kite Connect. The access token comes from the daily login
     # (`trading-agents kite-login`) and expires at 6 AM IST the next day.

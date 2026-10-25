@@ -4,6 +4,7 @@ ib_async type, so the adapter's mapping is checked against IB's shapes."""
 
 import asyncio
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -27,6 +28,7 @@ from trading_agents.brokers.ib import InteractiveBrokersAdapter, duration_for  #
 from trading_agents.contracts.broker import OrderRequest  # noqa: E402
 
 _NOW = datetime(2026, 10, 26, 15, 0, tzinfo=UTC)
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 def fill(trade: Trade, price: float, commission: float = 1.0) -> None:
@@ -349,7 +351,8 @@ async def test_historical_bars_request_and_inclusive_date_filter():
 
     assert [b.close for b in bars] == [1.6]
     assert bars[0].timestamp == datetime(2024, 5, 31)
-    assert fake.history_kwargs["endDateTime"] == datetime(2024, 6, 1)
+    # A past range ends at the following midnight, New York time.
+    assert fake.history_kwargs["endDateTime"] == datetime(2024, 6, 1, tzinfo=NEW_YORK)
     assert fake.history_kwargs["durationStr"] == "1 D"
     assert fake.history_kwargs["barSizeSetting"] == "1 day"
     assert fake.history_kwargs["useRTH"] is True
@@ -387,3 +390,60 @@ async def test_ib_check_reports_the_account_read_only(monkeypatch):
     assert lines[0] == "Connected to 127.0.0.1:4002 - account DU1234567 (paper)"
     assert "Equity: 3,000.00" in lines[1]
     assert lines[2:] == ["Positions: 1", "  AAPL: 10 @ 180.00 (value 2,000.00)"]
+
+
+# --- IB as the live loop's market data ----------------------------------------
+
+
+def _bar(day: date, close: float = 1.0) -> BarData:
+    return BarData(date=day, open=1, high=2, low=0.5, close=close, volume=100)
+
+
+async def test_a_range_through_today_asks_ib_for_data_up_to_now():
+    # Mid-session Monday 2026-10-26: IB rejects an end in the future.
+    fake = FakeIB()
+    fake.bars = [_bar(date(2026, 10, 23)), _bar(date(2026, 10, 26), close=101.5)]
+    adapter = InteractiveBrokersAdapter(
+        ib=fake, now=lambda: datetime(2026, 10, 26, 19, 30, tzinfo=UTC)
+    )
+    await adapter.connect()
+
+    bars = await adapter.get_bars("AAPL", date(2026, 10, 20), date(2026, 10, 26), "1d")
+
+    assert fake.history_kwargs["endDateTime"] == ""
+    assert fake.history_kwargs["durationStr"] == "7 D"
+    assert bars[-1].timestamp == datetime(2026, 10, 26)  # today's bar so far
+    assert bars[-1].close == 101.5
+
+
+async def test_no_bars_from_ib_raises_a_hint_about_market_data_permissions():
+    adapter, fake = await _connected()
+    fake.bars = []
+
+    with pytest.raises(BrokerError, match="market-data permissions"):
+        await adapter.get_bars("AAPL", date(2024, 5, 1), date(2024, 5, 31), "1d")
+
+
+async def test_historical_requests_are_sent_one_at_a_time():
+    in_flight = 0
+    peak = 0
+
+    class PacedIB(FakeIB):
+        async def reqHistoricalDataAsync(self, contract, **kwargs):  # noqa: N802
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return [_bar(date(2024, 5, 31))]
+
+    adapter, _ = await _connected(PacedIB())
+
+    await asyncio.gather(
+        *(
+            adapter.get_bars(t, date(2024, 5, 1), date(2024, 5, 31), "1d")
+            for t in ("AAPL", "MSFT", "GOOGL", "AMZN")
+        )
+    )
+
+    assert peak == 1  # inside IB's historical-data pacing limits
