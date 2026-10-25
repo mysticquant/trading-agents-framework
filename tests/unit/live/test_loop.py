@@ -303,6 +303,33 @@ async def test_a_rejected_order_does_not_stop_the_others(env):
     assert [o.ticker for o in broker.placed] == ["MSFT"]
 
 
+@pytest.mark.parametrize("is_async", [False, True])
+async def test_paper_brokers_are_marked_at_todays_close_before_the_balance(env, is_async):
+    events = []
+
+    class MarkingBroker(FakeBroker):
+        async def get_account_balance(self):
+            events.append("balance")
+            return await super().get_account_balance()
+
+    broker = MarkingBroker()
+    if is_async:
+
+        async def mark_price(ticker, price):
+            events.append(("mark", ticker, price))
+    else:
+
+        def mark_price(ticker, price):
+            events.append(("mark", ticker, price))
+
+    broker.mark_price = mark_price
+    data = FakeData({"AAPL": _bars("AAPL", TODAY, price=123.0), "MSFT": _bars("MSFT", TODAY)})
+
+    await _loop(env, broker=broker, data=data, decisions=[]).run_once()
+
+    assert events == [("mark", "AAPL", 123.0), ("mark", "MSFT", 100.0), "balance"]
+
+
 # --- scheduling loop ------------------------------------------------------------
 
 

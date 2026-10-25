@@ -12,3 +12,6 @@ build/
 # Live-trading journals/state (private) and the kill-switch file
 data/live/
 KILL_SWITCH
+
+# Rust build output
+execution_service/target/

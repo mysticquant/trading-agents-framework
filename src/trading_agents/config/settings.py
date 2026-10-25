@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     # `--mode live` and allow_live_trading=true. The decision time is
     # exchange-local "HH:MM"; empty means 15:30 New York for IB and 15:00
     # Mumbai for Kite (both 30 minutes before the close).
-    live_broker: Literal["ib", "kite"] = "ib"
+    live_broker: Literal["ib", "kite", "execd"] = "ib"
     allow_live_trading: bool = False
     live_decision_time: str | None = None
     live_max_order_pct: float = Field(default=0.05, gt=0.0, le=1.0)
@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     live_max_daily_drawdown_pct: float = Field(default=0.02, gt=0.0, le=1.0)
     live_kill_switch_path: Path = Path("KILL_SWITCH")
     live_state_dir: Path = Path("data/live")
+
+    # The `execd` execution service (execution_service/, Rust) when
+    # live_broker is "execd". execd_market picks the schedule, evidence, and
+    # fallback data: "nse" (Kite symbols) or "us".
+    execd_host: str = "127.0.0.1"
+    execd_port: int = 7600
+    execd_token: SecretStr | None = None
+    execd_market: Literal["nse", "us"] = "nse"
 
     # SEC EDGAR filings (point-in-time news evidence) are fetched only when
     # this is set; SEC requires it to name you with a contact email.

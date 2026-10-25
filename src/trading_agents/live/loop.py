@@ -16,6 +16,7 @@ Market holidays are detected by the absence of a bar dated today.
 
 import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -151,6 +152,21 @@ class LiveTradingLoop:
         try:
             if not self.broker.is_connected():
                 await self.broker.connect()
+        except BrokerError as exc:
+            report.skipped_reason = f"broker unavailable: {exc}"
+            return
+
+        market_data = await self._todays_market_data(report)
+        if not market_data:
+            report.skipped_reason = (
+                f"no bar dated {report.trading_day} for any ticker (market closed?)"
+            )
+            return
+
+        try:
+            # Simulated (paper) brokers fill at the price they were last
+            # marked at; mark before reading the balance so equity is current.
+            await self._mark_prices(market_data)
             balance = await self.broker.get_account_balance()
             positions = await self.broker.get_positions()
         except BrokerError as exc:
@@ -164,13 +180,6 @@ class LiveTradingLoop:
         if halted := halt_reason(self.guardrails, state, balance.equity):
             self.state_store.save(state)
             report.skipped_reason = halted
-            return
-
-        market_data = await self._todays_market_data(report)
-        if not market_data:
-            report.skipped_reason = (
-                f"no bar dated {report.trading_day} for any ticker (market closed?)"
-            )
             return
 
         cycle = await self.orchestrator.run_cycle(
@@ -249,6 +258,15 @@ class LiveTradingLoop:
             entry["order_id"] = order.order_id
             if order.fill_price is not None:
                 entry["fill_price"] = order.fill_price
+
+    async def _mark_prices(self, market_data: dict[str, list[MarketBar]]) -> None:
+        mark = getattr(self.broker, "mark_price", None)
+        if mark is None:
+            return
+        for ticker, bars in market_data.items():
+            result = mark(ticker, bars[-1].close)
+            if inspect.isawaitable(result):
+                await result
 
     async def _todays_market_data(self, report: CycleReport) -> dict[str, list[MarketBar]]:
         """Bars through today for each ticker that has a bar dated today;
