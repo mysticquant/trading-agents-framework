@@ -1,4 +1,5 @@
-"""CLI entrypoint: `trading-agents run-backtest [--universe ... --start ... --end ...]`.
+"""CLI entrypoint: `trading-agents run-backtest [--universe ... --start ... --end ...]`
+and `trading-agents ib-check` (read-only Interactive Brokers connectivity check).
 
 Wires every agent, the LLM client, the paper broker, and a cached
 yfinance data provider together, then runs a backtest and prints summary
@@ -24,8 +25,9 @@ from trading_agents.agents.risk_manager import RiskManagerAgent
 from trading_agents.agents.screener import ScreenerAgent
 from trading_agents.agents.trader import TraderAgent
 from trading_agents.backtest.runner import BacktestRunner
+from trading_agents.brokers.base import BrokerError
 from trading_agents.brokers.paper import PaperBrokerAdapter
-from trading_agents.config.settings import Settings
+from trading_agents.config.settings import ConfigurationError, Settings
 from trading_agents.contracts.backtest import BacktestResult
 from trading_agents.contracts.trading import ExecutionCosts
 from trading_agents.data.cache import CachedDataProvider, ParquetCache
@@ -87,8 +89,11 @@ def build_llm(settings: Settings) -> tuple[LLMClient, LLMRoleRegistry]:
         )
         return client, registry
 
-    # Settings validation guarantees a key for the anthropic provider.
-    assert settings.anthropic_api_key is not None
+    if settings.anthropic_api_key is None:
+        raise ConfigurationError(
+            "ANTHROPIC_API_KEY is required when LLM_PROVIDER is 'anthropic' "
+            "(set it in .env, or set LLM_PROVIDER=ollama to use a local model)."
+        )
     client = AnthropicLLMClient(api_key=settings.anthropic_api_key.get_secret_value())
     return client, LLMRoleRegistry(settings.llm_role_overrides)
 
@@ -142,32 +147,43 @@ async def run_backtest(settings: Settings) -> BacktestResult:
         await broker.disconnect()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(prog="trading-agents")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+async def ib_check(settings: Settings) -> list[str]:
+    """Connect to TWS/IB Gateway read-only and describe the account. Read-only
+    mode cannot place orders, so live accounts are allowed here; the report
+    says which kind it is."""
+    # Imported lazily: ib_async is an optional extra (`pip install -e ".[ib]"`).
+    from trading_agents.brokers.ib import InteractiveBrokersAdapter, is_paper_account
 
-    backtest_parser = subparsers.add_parser("run-backtest")
-    backtest_parser.add_argument("--universe", help="Comma-separated tickers, e.g. AAPL,MSFT")
-    backtest_parser.add_argument("--start", help="YYYY-MM-DD")
-    backtest_parser.add_argument("--end", help="YYYY-MM-DD")
-
-    args = parser.parse_args()
-
-    overrides = {}
-    if args.universe:
-        overrides["ticker_universe"] = args.universe
-    if args.start:
-        overrides["backtest_start_date"] = args.start
-    if args.end:
-        overrides["backtest_end_date"] = args.end
+    adapter = InteractiveBrokersAdapter(
+        host=settings.ib_host,
+        port=settings.ib_port,
+        client_id=settings.ib_client_id,
+        account=settings.ib_account,
+        readonly=True,
+        allow_live=True,
+    )
+    await adapter.connect()
     try:
-        settings = Settings(**overrides)
-        result = asyncio.run(run_backtest(settings))
-    except ValidationError as exc:
-        problems = "; ".join(error["msg"].removeprefix("Value error, ") for error in exc.errors())
-        sys.exit(f"trading-agents: invalid configuration: {problems}")
-    except OllamaError as exc:
-        sys.exit(f"trading-agents: {exc}")
+        balance = await adapter.get_account_balance()
+        positions = await adapter.get_positions()
+    finally:
+        await adapter.disconnect()
+
+    kind = "paper" if is_paper_account(adapter.account) else "LIVE"
+    lines = [
+        f"Connected to {settings.ib_host}:{settings.ib_port} - account {adapter.account} ({kind})",
+        f"Cash: {balance.cash:,.2f}  Equity: {balance.equity:,.2f}  "
+        f"Buying power: {balance.buying_power:,.2f}",
+        f"Positions: {len(positions)}",
+    ]
+    lines += [
+        f"  {p.ticker}: {p.quantity:g} @ {p.avg_cost:,.2f} (value {p.market_value:,.2f})"
+        for p in positions.values()
+    ]
+    return lines
+
+
+def _print_backtest(result: BacktestResult) -> None:
     print(f"Period: {result.start_date} -> {result.end_date}")
     print(f"Universe: {', '.join(result.ticker_universe)}")
     print(f"Total return: {result.total_return_pct:.2f}%")
@@ -178,6 +194,47 @@ def main() -> None:
     print(f"Final equity: {result.final_portfolio_state.equity:.2f}")
     if result.cycle_errors:
         print(f"Skipped after errors: {len(result.cycle_errors)} (see log for details)")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="trading-agents")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    backtest_parser = subparsers.add_parser("run-backtest")
+    backtest_parser.add_argument("--universe", help="Comma-separated tickers, e.g. AAPL,MSFT")
+    backtest_parser.add_argument("--start", help="YYYY-MM-DD")
+    backtest_parser.add_argument("--end", help="YYYY-MM-DD")
+
+    subparsers.add_parser(
+        "ib-check", help="Connect to TWS/IB Gateway read-only and show the account"
+    )
+
+    args = parser.parse_args()
+
+    overrides = {}
+    if args.command == "run-backtest":
+        if args.universe:
+            overrides["ticker_universe"] = args.universe
+        if args.start:
+            overrides["backtest_start_date"] = args.start
+        if args.end:
+            overrides["backtest_end_date"] = args.end
+    try:
+        settings = Settings(**overrides)
+        if args.command == "ib-check":
+            for line in asyncio.run(ib_check(settings)):
+                print(line)
+        else:
+            _print_backtest(asyncio.run(run_backtest(settings)))
+    except ValidationError as exc:
+        problems = "; ".join(error["msg"].removeprefix("Value error, ") for error in exc.errors())
+        sys.exit(f"trading-agents: invalid configuration: {problems}")
+    except ModuleNotFoundError as exc:
+        if exc.name != "ib_async":
+            raise
+        sys.exit('trading-agents: ib-check needs the IB extra: pip install -e ".[ib]"')
+    except (ConfigurationError, OllamaError, BrokerError) as exc:
+        sys.exit(f"trading-agents: {exc}")
 
 
 if __name__ == "__main__":
