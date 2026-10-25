@@ -1,5 +1,6 @@
 """CLI entrypoint: `trading-agents run-backtest [--universe ... --start ... --end ...]`
-and `trading-agents ib-check` (read-only Interactive Brokers connectivity check).
+plus read-only broker checks (`ib-check`, `kite-check`) and the daily Zerodha
+login (`kite-login`).
 
 Wires every agent, the LLM client, the paper broker, and a cached
 yfinance data provider together, then runs a backtest and prints summary
@@ -26,6 +27,12 @@ from trading_agents.agents.screener import ScreenerAgent
 from trading_agents.agents.trader import TraderAgent
 from trading_agents.backtest.runner import BacktestRunner
 from trading_agents.brokers.base import BrokerError
+from trading_agents.brokers.kite import (
+    KiteBrokerAdapter,
+    KiteRestClient,
+    create_session,
+    login_url,
+)
 from trading_agents.brokers.paper import PaperBrokerAdapter
 from trading_agents.config.settings import ConfigurationError, Settings
 from trading_agents.contracts.backtest import BacktestResult
@@ -183,6 +190,64 @@ async def ib_check(settings: Settings) -> list[str]:
     return lines
 
 
+def _kite_client(settings: Settings, *, need_token: bool) -> KiteRestClient:
+    if not settings.kite_api_key:
+        raise ConfigurationError("KITE_API_KEY is not set in .env.")
+    token = settings.kite_access_token.get_secret_value() if settings.kite_access_token else ""
+    if need_token and not token:
+        raise ConfigurationError(
+            "KITE_ACCESS_TOKEN is not set; run `trading-agents kite-login` first."
+        )
+    return KiteRestClient(settings.kite_api_key, token)
+
+
+async def kite_login(settings: Settings, request_token: str | None) -> list[str]:
+    """Without a request token: how to log in. With one: exchange it for
+    the day's access token."""
+    client = _kite_client(settings, need_token=False)
+    if not request_token:
+        return [
+            "1. Open this URL and log in to Kite:",
+            f"   {login_url(client.api_key)}",
+            "2. Kite redirects to your app's redirect URL with ?request_token=... "
+            "(valid for a few minutes).",
+            "3. Run: trading-agents kite-login --request-token <that token>",
+        ]
+    if settings.kite_api_secret is None:
+        raise ConfigurationError("KITE_API_SECRET is not set in .env.")
+    session = await create_session(
+        client.api_key, settings.kite_api_secret.get_secret_value(), request_token
+    )
+    return [
+        f"Logged in as {session.get('user_id', '?')}. Add this to .env "
+        "(valid until 6 AM IST tomorrow):",
+        f"KITE_ACCESS_TOKEN={session['access_token']}",
+    ]
+
+
+async def kite_check(settings: Settings) -> list[str]:
+    """Read-only: the adapter is built without allow_live, so it cannot
+    place orders."""
+    adapter = KiteBrokerAdapter(_kite_client(settings, need_token=True))
+    await adapter.connect()
+    try:
+        balance = await adapter.get_account_balance()
+        positions = await adapter.get_positions()
+    finally:
+        await adapter.disconnect()
+    lines = [
+        f"Connected to Kite as {adapter.user_id} (live account; orders disabled here)",
+        f"Cash: {balance.cash:,.2f}  Equity: {balance.equity:,.2f}  "
+        f"Buying power: {balance.buying_power:,.2f}",
+        f"Positions: {len(positions)}",
+    ]
+    lines += [
+        f"  {p.ticker}: {p.quantity:g} @ {p.avg_cost:,.2f} (value {p.market_value:,.2f})"
+        for p in positions.values()
+    ]
+    return lines
+
+
 def _print_backtest(result: BacktestResult) -> None:
     print(f"Period: {result.start_date} -> {result.end_date}")
     print(f"Universe: {', '.join(result.ticker_universe)}")
@@ -209,6 +274,14 @@ def main() -> None:
         "ib-check", help="Connect to TWS/IB Gateway read-only and show the account"
     )
 
+    login_parser = subparsers.add_parser(
+        "kite-login", help="Zerodha Kite daily login: get the day's access token"
+    )
+    login_parser.add_argument("--request-token", help="request_token from Kite's redirect")
+    subparsers.add_parser(
+        "kite-check", help="Connect to Zerodha Kite read-only and show the account"
+    )
+
     args = parser.parse_args()
 
     overrides = {}
@@ -222,10 +295,16 @@ def main() -> None:
     try:
         settings = Settings(**overrides)
         if args.command == "ib-check":
-            for line in asyncio.run(ib_check(settings)):
-                print(line)
+            lines = asyncio.run(ib_check(settings))
+        elif args.command == "kite-login":
+            lines = asyncio.run(kite_login(settings, args.request_token))
+        elif args.command == "kite-check":
+            lines = asyncio.run(kite_check(settings))
         else:
+            lines = []
             _print_backtest(asyncio.run(run_backtest(settings)))
+        for line in lines:
+            print(line)
     except ValidationError as exc:
         problems = "; ".join(error["msg"].removeprefix("Value error, ") for error in exc.errors())
         sys.exit(f"trading-agents: invalid configuration: {problems}")
