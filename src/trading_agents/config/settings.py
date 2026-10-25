@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     ib_client_id: int = 1
     ib_account: str = ""
 
+    # Zerodha Kite Connect. The access token comes from the daily login
+    # (`trading-agents kite-login`) and expires at 6 AM IST the next day.
+    kite_api_key: str | None = None
+    kite_api_secret: SecretStr | None = None
+    kite_access_token: SecretStr | None = None
+
     # SEC EDGAR filings (point-in-time news evidence) are fetched only when
     # this is set; SEC requires it to name you with a contact email.
     sec_user_agent: str | None = None

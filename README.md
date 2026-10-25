@@ -7,9 +7,10 @@ Researcher, a Trader, a Risk Manager, and a Portfolio Manager collaborate
 on each trading decision.
 
 It has a fully testable Python core, a simulated (paper) broker with a
-backtest runner, and an Interactive Brokers adapter (paper accounts by
-default). Zerodha Kite, a live trading loop, and a low-latency Rust/C++
-execution service are future work — see "Out of scope" below.
+backtest runner, and adapters for Interactive Brokers (paper accounts by
+default) and Zerodha Kite (orders disabled by default). A live trading
+loop and a low-latency Rust/C++ execution service are future work — see
+"Out of scope" below.
 
 ## Setup
 
@@ -109,6 +110,40 @@ Nothing in the agent pipeline places IB orders yet — the backtest always
 uses `PaperBrokerAdapter`. Wiring a real broker into a trading loop, with
 its own safeguards, is the next piece of future work.
 
+## Zerodha Kite
+
+`KiteBrokerAdapter` and `KiteHistoricalDataProvider` (`brokers/kite.py`)
+call the Kite Connect v3 REST API directly (no extra dependency). You need
+a Kite Connect app (API key and secret, with its redirect URL set) in
+`.env` as `KITE_API_KEY` / `KITE_API_SECRET`.
+
+**Kite has no paper trading: every order is real money.** The adapter
+refuses to place orders unless it is built with `allow_live=True`; reads
+always work. Nothing in the pipeline places Kite orders yet.
+
+Daily login — Kite access tokens expire at 6 AM IST:
+
+```powershell
+.venv\Scripts\trading-agents kite-login                         # prints the login URL
+.venv\Scripts\trading-agents kite-login --request-token <token> # from the redirect
+# add the printed KITE_ACCESS_TOKEN=... line to .env, then (read-only):
+.venv\Scripts\trading-agents kite-check
+```
+
+Behavior and requirements:
+- Under SEBI's retail algo rules, Zerodha only accepts API **orders** from
+  a static IP registered with them; reads work from anywhere. A refusal
+  that mentions the IP says so.
+- Market orders are sent with Kite's automatic market protection
+  (`market_protection=-1`), which API market orders require.
+- Tickers are NSE trading symbols (`INFY`, not yfinance's `INFY.NS`);
+  quantities are floored to whole shares; the product is CNC (delivery).
+- Positions combine settled and T1 holdings with today's net positions.
+- Historical candles may need the historical-data add-on on your Kite
+  Connect app; long ranges are fetched in chunks within Kite's per-request
+  limits, and requests are throttled to Kite's published rate limits.
+- Kite's order APIs don't report charges, so `Order.commission` is 0.
+
 ## Architecture
 
 - `contracts/` — pydantic data contracts shared by every layer (market
@@ -122,9 +157,10 @@ its own safeguards, is the next piece of future work.
   echoed inputs, hard risk/cash limits) are filled in by Python, not the
   LLM.
 - `brokers/` — the `BrokerAdapter` Protocol, `PaperBrokerAdapter`
-  (simulated), and `InteractiveBrokersAdapter` (`brokers/ib.py`). A Kite
-  adapter and a future low-latency execution service implement the same
-  Protocol without any orchestration-layer changes.
+  (simulated), `InteractiveBrokersAdapter` (`brokers/ib.py`), and
+  `KiteBrokerAdapter` plus `KiteHistoricalDataProvider` (`brokers/kite.py`).
+  A future low-latency execution service implements the same Protocol
+  without any orchestration-layer changes.
 - `data/` — `HistoricalDataProvider` Protocol, the `YFinanceProvider`
   implementation, and a parquet-backed cache. `data/evidence/` builds the
   fundamentals/sentiment/news analysts' evidence (see below).
@@ -173,9 +209,6 @@ so fundamentals are close to, but not exactly, what was known at the time.
 
 ## Out of scope for this phase (future work)
 
-- **Zerodha Kite** adapter (`kiteconnect`) — `BrokerAdapter`'s lifecycle
-  methods (`connect`/`disconnect`/`is_connected`) exist so it can be added
-  without touching `agents/` or `orchestration/`.
 - A **Rust/C++ low-latency execution service** for live order routing,
   reached from Python over gRPC or a local socket/queue, implementing the
   same `BrokerAdapter` Protocol.
