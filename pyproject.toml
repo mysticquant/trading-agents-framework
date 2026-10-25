@@ -33,9 +33,10 @@ packages = ["src/trading_agents"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["src"]
-addopts = "-m 'not live_llm'"
+addopts = "-m 'not live_llm and not live_ollama'"
 markers = [
     "live_llm: hits the real Anthropic API and costs real money; opt-in only",
+    "live_ollama: needs a local Ollama server with the configured model pulled; opt-in only",
 ]
 
 [tool.mypy]

@@ -7,7 +7,7 @@ from trading_agents.config.settings import Settings
 def _isolated_env(monkeypatch, tmp_path):
     # Keep a developer's real .env / environment out of these tests.
     monkeypatch.chdir(tmp_path)
-    for var in ("TICKER_UNIVERSE", "LLM_ROLE_OVERRIDES"):
+    for var in ("TICKER_UNIVERSE", "LLM_ROLE_OVERRIDES", "LLM_PROVIDER", "OLLAMA_MODEL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
@@ -33,6 +33,24 @@ def test_ticker_universe_also_accepts_a_json_list(monkeypatch):
 
 def test_ticker_universe_csv_override_from_the_cli():
     assert Settings(ticker_universe="NVDA,AMD").ticker_universe == ["NVDA", "AMD"]
+
+
+def test_anthropic_provider_requires_an_api_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY is required"):
+        Settings()
+
+
+def test_ollama_provider_needs_no_api_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3:8b")
+
+    settings = Settings()
+
+    assert settings.anthropic_api_key is None
+    assert settings.ollama_model == "qwen3:8b"
 
 
 def test_llm_role_overrides_parse_from_json(monkeypatch):

@@ -2,12 +2,16 @@
 
 Wires every agent, the LLM client, the paper broker, and a cached
 yfinance data provider together, then runs a backtest and prints summary
-stats. This is the first thing to run end-to-end once an Anthropic API key
-is in `.env` — see the README for the manual opt-in live-LLM smoke test.
+stats. The LLM is Claude by default (needs ANTHROPIC_API_KEY in `.env`) or a
+local Ollama model with LLM_PROVIDER=ollama — see the README for both and
+for the manual opt-in live-LLM smoke tests.
 """
 
 import argparse
 import asyncio
+import sys
+
+from pydantic import ValidationError
 
 from trading_agents.agents.analysts.fundamentals import FundamentalsAnalystAgent
 from trading_agents.agents.analysts.news import NewsAnalystAgent
@@ -32,6 +36,7 @@ from trading_agents.data.evidence.yfinance_source import YFinanceMarketDataSourc
 from trading_agents.data.providers.yfinance_provider import YFinanceProvider
 from trading_agents.llm.client import AnthropicLLMClient, LLMClient
 from trading_agents.llm.config import LLMRoleRegistry, RoleModelConfig
+from trading_agents.llm.ollama_client import OllamaError, OllamaLLMClient
 from trading_agents.orchestration.pipeline import DecisionCycleOrchestrator
 
 
@@ -66,14 +71,52 @@ def build_evidence_provider(settings: Settings) -> EvidenceProvider:
     return DefaultEvidenceProvider(YFinanceMarketDataSource(), filings)
 
 
+def build_llm(settings: Settings) -> tuple[LLMClient, LLMRoleRegistry]:
+    """The configured LLM client, plus a role registry whose default models
+    belong to that provider (role overrides apply to either)."""
+    if settings.llm_provider == "ollama":
+        client: LLMClient = OllamaLLMClient(
+            base_url=settings.ollama_base_url,
+            timeout_seconds=settings.ollama_timeout_seconds,
+            max_concurrency=settings.ollama_max_concurrency,
+        )
+        registry = LLMRoleRegistry(
+            settings.llm_role_overrides,
+            default_model=settings.ollama_model,
+            high_stakes_model=settings.ollama_model,
+        )
+        return client, registry
+
+    # Settings validation guarantees a key for the anthropic provider.
+    assert settings.anthropic_api_key is not None
+    client = AnthropicLLMClient(api_key=settings.anthropic_api_key.get_secret_value())
+    return client, LLMRoleRegistry(settings.llm_role_overrides)
+
+
+AGENT_ROLES = (
+    ScreenerAgent.role,
+    FundamentalsAnalystAgent.role,
+    SentimentAnalystAgent.role,
+    NewsAnalystAgent.role,
+    TechnicalAnalystAgent.role,
+    ResearcherAgent.role,
+    TraderAgent.role,
+    RiskManagerAgent.role,
+    PortfolioManagerAgent.role,
+)
+
+
 async def run_backtest(settings: Settings) -> BacktestResult:
-    llm_client = AnthropicLLMClient(api_key=settings.anthropic_api_key.get_secret_value())
+    llm_client, role_registry = build_llm(settings)
+    if isinstance(llm_client, OllamaLLMClient):
+        # Fail now, not after every simulated day has errored.
+        await llm_client.check_models({role_registry.for_role(r).model for r in AGENT_ROLES})
     # One cost model shared by the broker and the agents that size buys, so
     # cash-limited trades are sized to what the broker will actually charge.
     execution_costs = ExecutionCosts()
     orchestrator = build_orchestrator(
         llm_client,
-        role_registry=LLMRoleRegistry(settings.llm_role_overrides),
+        role_registry=role_registry,
         execution_costs=execution_costs,
         evidence_provider=build_evidence_provider(settings),
     )
@@ -117,9 +160,14 @@ def main() -> None:
         overrides["backtest_start_date"] = args.start
     if args.end:
         overrides["backtest_end_date"] = args.end
-    settings = Settings(**overrides)
-
-    result = asyncio.run(run_backtest(settings))
+    try:
+        settings = Settings(**overrides)
+        result = asyncio.run(run_backtest(settings))
+    except ValidationError as exc:
+        problems = "; ".join(error["msg"].removeprefix("Value error, ") for error in exc.errors())
+        sys.exit(f"trading-agents: invalid configuration: {problems}")
+    except OllamaError as exc:
+        sys.exit(f"trading-agents: {exc}")
     print(f"Period: {result.start_date} -> {result.end_date}")
     print(f"Universe: {', '.join(result.ticker_universe)}")
     print(f"Total return: {result.total_return_pct:.2f}%")

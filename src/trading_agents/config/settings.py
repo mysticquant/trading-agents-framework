@@ -4,16 +4,27 @@ via plain constructor arguments (no global singleton)."""
 import json
 from datetime import date
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
-    anthropic_api_key: SecretStr
+    # Which LLMClient the CLI builds. "ollama" runs every agent on a local
+    # Ollama server and needs no API key.
+    llm_provider: Literal["anthropic", "ollama"] = "anthropic"
+    # Required when llm_provider is "anthropic".
+    anthropic_api_key: SecretStr | None = None
+
+    ollama_base_url: str = "http://localhost:11434"
+    # Model for every role unless LLM_ROLE_OVERRIDES says otherwise; must be
+    # pulled first (`ollama pull <name>`).
+    ollama_model: str = "llama3.1:8b"
+    ollama_timeout_seconds: float = 300.0
+    ollama_max_concurrency: int = 2
 
     # `NoDecode` stops pydantic-settings from JSON-decoding the raw env value
     # before `_split_csv` sees it, so the documented `AAPL,MSFT,GOOGL` form works.
@@ -40,6 +51,15 @@ class Settings(BaseSettings):
                 return json.loads(value)
             return [ticker.strip() for ticker in value.split(",") if ticker.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _require_key_for_anthropic(self) -> "Settings":
+        if self.llm_provider == "anthropic" and self.anthropic_api_key is None:
+            raise ValueError(
+                "ANTHROPIC_API_KEY is required when LLM_PROVIDER is 'anthropic' "
+                "(set it in .env, or set LLM_PROVIDER=ollama to use a local model)."
+            )
+        return self
 
     @field_validator("llm_role_overrides", mode="before")
     @classmethod

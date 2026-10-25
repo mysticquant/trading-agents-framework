@@ -29,14 +29,24 @@ class RoleModelConfig:
 
 
 class LLMRoleRegistry:
-    """Resolves a `RoleModelConfig` per agent role, honoring optional overrides."""
+    """Resolves a `RoleModelConfig` per agent role, honoring optional overrides.
+    `default_model`/`high_stakes_model` set the two tiers (Claude models
+    unless given, e.g. Ollama model names for a local provider)."""
 
-    def __init__(self, overrides: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        overrides: dict[str, str] | None = None,
+        *,
+        default_model: str = DEFAULT_MODEL,
+        high_stakes_model: str = HIGH_STAKES_MODEL,
+    ) -> None:
         self._overrides = overrides or {}
+        self._default_model = default_model
+        self._high_stakes_model = high_stakes_model
 
     def for_role(self, role: str) -> RoleModelConfig:
         model = self._overrides.get(
-            role, HIGH_STAKES_MODEL if role in HIGH_STAKES_ROLES else DEFAULT_MODEL
+            role, self._high_stakes_model if role in HIGH_STAKES_ROLES else self._default_model
         )
         prompt_path = PROMPTS_DIR / f"{role}.md"
         return RoleModelConfig(role=role, model=model, system_prompt_path=prompt_path)
