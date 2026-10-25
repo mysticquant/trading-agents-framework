@@ -6,8 +6,12 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+class ConfigurationError(ValueError):
+    """A setting a command needs is missing or inconsistent."""
 
 
 class Settings(BaseSettings):
@@ -16,7 +20,7 @@ class Settings(BaseSettings):
     # Which LLMClient the CLI builds. "ollama" runs every agent on a local
     # Ollama server and needs no API key.
     llm_provider: Literal["anthropic", "ollama"] = "anthropic"
-    # Required when llm_provider is "anthropic".
+    # Required for LLM commands when llm_provider is "anthropic".
     anthropic_api_key: SecretStr | None = None
 
     ollama_base_url: str = "http://localhost:11434"
@@ -37,6 +41,14 @@ class Settings(BaseSettings):
 
     data_cache_dir: Path = Path("data/cache")
 
+    # Interactive Brokers (TWS / IB Gateway socket API). Paper TWS listens on
+    # 7497 and paper Gateway on 4002; ib_account may be left empty when the
+    # login manages a single account.
+    ib_host: str = "127.0.0.1"
+    ib_port: int = 7497
+    ib_client_id: int = 1
+    ib_account: str = ""
+
     # SEC EDGAR filings (point-in-time news evidence) are fetched only when
     # this is set; SEC requires it to name you with a contact email.
     sec_user_agent: str | None = None
@@ -51,15 +63,6 @@ class Settings(BaseSettings):
                 return json.loads(value)
             return [ticker.strip() for ticker in value.split(",") if ticker.strip()]
         return value
-
-    @model_validator(mode="after")
-    def _require_key_for_anthropic(self) -> "Settings":
-        if self.llm_provider == "anthropic" and self.anthropic_api_key is None:
-            raise ValueError(
-                "ANTHROPIC_API_KEY is required when LLM_PROVIDER is 'anthropic' "
-                "(set it in .env, or set LLM_PROVIDER=ollama to use a local model)."
-            )
-        return self
 
     @field_validator("llm_role_overrides", mode="before")
     @classmethod

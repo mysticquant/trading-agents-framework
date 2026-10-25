@@ -1,5 +1,7 @@
+import pytest
+
 from trading_agents.cli.main import build_evidence_provider, build_llm, build_orchestrator
-from trading_agents.config.settings import Settings
+from trading_agents.config.settings import ConfigurationError, Settings
 from trading_agents.contracts.trading import ExecutionCosts
 from trading_agents.data.evidence.sec_edgar import SecEdgarFilingsSource
 from trading_agents.llm.client import AnthropicLLMClient
@@ -61,6 +63,11 @@ def test_build_llm_uses_ollama_models_for_every_role_unless_overridden():
     assert registry.for_role("screener").model == "llama3.1:8b"
     assert registry.for_role("portfolio_manager").model == "llama3.1:8b"
     assert registry.for_role("researcher").model == "qwen3:32b"
+
+
+def test_build_llm_requires_an_api_key_for_claude():
+    with pytest.raises(ConfigurationError, match="ANTHROPIC_API_KEY is required"):
+        build_llm(Settings(_env_file=None))
 
 
 def test_build_llm_defaults_to_claude():

@@ -35,13 +35,6 @@ def test_ticker_universe_csv_override_from_the_cli():
     assert Settings(ticker_universe="NVDA,AMD").ticker_universe == ["NVDA", "AMD"]
 
 
-def test_anthropic_provider_requires_an_api_key(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY")
-
-    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY is required"):
-        Settings()
-
-
 def test_ollama_provider_needs_no_api_key(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY")
     monkeypatch.setenv("LLM_PROVIDER", "ollama")

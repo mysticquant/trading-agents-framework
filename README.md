@@ -6,10 +6,10 @@ a Screener, four Analysts (fundamentals, sentiment, news, technical), a
 Researcher, a Trader, a Risk Manager, and a Portfolio Manager collaborate
 on each trading decision.
 
-**This is Phase 1**: a fully testable Python core with a simulated
-(paper) broker and a backtest runner. Real broker connectivity
-(Interactive Brokers, Zerodha Kite) and a low-latency Rust/C++ execution
-service are future phases — see "Out of scope" below.
+It has a fully testable Python core, a simulated (paper) broker with a
+backtest runner, and an Interactive Brokers adapter (paper accounts by
+default). Zerodha Kite, a live trading loop, and a low-latency Rust/C++
+execution service are future work — see "Out of scope" below.
 
 ## Setup
 
@@ -75,6 +75,40 @@ summary stats (total return, Sharpe, max drawdown, win rate, trade count).
 Every order is simulated through `PaperBrokerAdapter` — nothing here
 touches a real brokerage account.
 
+## Interactive Brokers
+
+`InteractiveBrokersAdapter` (`brokers/ib.py`) talks to a running TWS or IB
+Gateway through its socket API, via the optional `ib_async` dependency:
+
+```powershell
+.venv\Scripts\pip install -e ".[ib]"
+```
+
+In TWS, enable the API (Configure > API > Settings > "Enable ActiveX and
+Socket Clients") and note the port: **paper TWS 7497, paper Gateway
+4002** (live: 7496 / 4001). Then set it in `.env` (`IB_PORT`, and
+`IB_ACCOUNT` if your login manages several accounts) and check the
+connection — read-only, so it cannot place orders:
+
+```powershell
+.venv\Scripts\trading-agents ib-check
+```
+
+Safety and behavior:
+- The adapter refuses non-paper accounts (paper IDs start with `D`)
+  unless built with `allow_live=True`.
+- Quantities are floored to whole shares; an order that rounds to zero is
+  rejected rather than silently changed.
+- `place_order` waits briefly for IB to accept or reject. A market order
+  placed outside regular hours stays queued and comes back as
+  `submitted`; poll `get_order_status` for the fill. Rejections raise
+  `OrderRejectedError` with IB's reason.
+- Only US stocks are mapped (`SMART` routing, USD).
+
+Nothing in the agent pipeline places IB orders yet — the backtest always
+uses `PaperBrokerAdapter`. Wiring a real broker into a trading loop, with
+its own safeguards, is the next piece of future work.
+
 ## Architecture
 
 - `contracts/` — pydantic data contracts shared by every layer (market
@@ -87,10 +121,10 @@ touches a real brokerage account.
   narrow, role-specific pydantic model; deterministic fields (timestamps,
   echoed inputs, hard risk/cash limits) are filled in by Python, not the
   LLM.
-- `brokers/` — the `BrokerAdapter` Protocol and `PaperBrokerAdapter` (the
-  only adapter implemented in this phase). Real IB/Kite adapters, and a
-  future low-latency execution service, implement the same Protocol
-  without any orchestration-layer changes.
+- `brokers/` — the `BrokerAdapter` Protocol, `PaperBrokerAdapter`
+  (simulated), and `InteractiveBrokersAdapter` (`brokers/ib.py`). A Kite
+  adapter and a future low-latency execution service implement the same
+  Protocol without any orchestration-layer changes.
 - `data/` — `HistoricalDataProvider` Protocol, the `YFinanceProvider`
   implementation, and a parquet-backed cache. `data/evidence/` builds the
   fundamentals/sentiment/news analysts' evidence (see below).
@@ -139,10 +173,9 @@ so fundamentals are close to, but not exactly, what was known at the time.
 
 ## Out of scope for this phase (future work)
 
-- **Interactive Brokers** adapter (`ib_async`) and **Zerodha Kite**
-  adapter (`kiteconnect`) — `BrokerAdapter`'s lifecycle methods
-  (`connect`/`disconnect`/`is_connected`) exist specifically so these can
-  be added without touching `agents/` or `orchestration/`.
+- **Zerodha Kite** adapter (`kiteconnect`) — `BrokerAdapter`'s lifecycle
+  methods (`connect`/`disconnect`/`is_connected`) exist so it can be added
+  without touching `agents/` or `orchestration/`.
 - A **Rust/C++ low-latency execution service** for live order routing,
   reached from Python over gRPC or a local socket/queue, implementing the
   same `BrokerAdapter` Protocol.

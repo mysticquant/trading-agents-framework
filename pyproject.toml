@@ -13,6 +13,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Interactive Brokers adapter (brokers/ib.py). Optional because ib_async pins
+# an older tzdata than pandas otherwise installs.
+ib = [
+    "ib_async>=2.1,<3",
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
