@@ -105,6 +105,14 @@ Safety and behavior:
   `submitted`; poll `get_order_status` for the fill. Rejections raise
   `OrderRejectedError` with IB's reason.
 - Only US stocks are mapped (`SMART` routing, USD).
+- The IB live loop takes its price bars from IB itself, so decisions use
+  the prices IB fills at. That needs market-data permissions on the
+  account; a paper account must be set (in Account Management) to share
+  the live account's subscriptions. Without them IB returns no bars and the
+  cycle reports the missing permissions; `IB_MARKET_DATA=yfinance` switches
+  back to Yahoo prices (about 15 minutes delayed during the session).
+  Fundamentals, sentiment, and news evidence still come from yfinance and
+  SEC EDGAR either way.
 
 The backtest always uses `PaperBrokerAdapter`; IB orders are placed only
 by the live trading loop (below).

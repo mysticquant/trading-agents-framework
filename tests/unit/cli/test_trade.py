@@ -159,3 +159,14 @@ async def test_execd_nse_fallback_data_uses_the_ns_suffix(monkeypatch):
 def test_execd_market_picks_the_schedule_and_evidence():
     assert build_schedule(_settings(**_EXECD)).timezone.key == "Asia/Kolkata"
     assert build_schedule(_settings(**_EXECD, execd_market="us")).timezone.key == "America/New_York"
+
+
+def test_ib_live_loop_uses_ib_market_data_by_default():
+    pytest.importorskip("ib_async")
+    from trading_agents.data.cache import CachedDataProvider
+
+    broker, data = build_live_broker(_settings(), "dry-run")
+    _, fallback = build_live_broker(_settings(ib_market_data="yfinance"), "dry-run")
+
+    assert data is broker  # decides on the prices IB fills at
+    assert isinstance(fallback, CachedDataProvider)
