@@ -338,7 +338,28 @@ impl KiteBackend {
             .or_else(|| placed["order_id"].as_u64().map(|id| id.to_string()))
             .ok_or_else(|| ServiceError::Broker("Kite returned no order_id".into()))?;
 
-        let record = self.wait_for_ack(&order_id).await?;
+        let record = match self.wait_for_ack(&order_id).await {
+            Ok(record) => record,
+            Err(err) => {
+                // Kite has accepted the order; only the status check failed.
+                // Never report that as "not placed": return it with its id so
+                // it can be tracked (and isn't sent again).
+                tracing::warn!(%order_id, error = %err, "order accepted but status check failed");
+                return Ok(Order {
+                    order_id,
+                    ticker: request.ticker.to_uppercase(),
+                    side: request.side,
+                    quantity: quantity as f64,
+                    order_type: request.order_type,
+                    limit_price,
+                    status: OrderStatus::Pending,
+                    submitted_at: Utc::now(),
+                    filled_at: None,
+                    fill_price: None,
+                    commission: 0.0,
+                });
+            }
+        };
         let order = record_to_order(&record)?;
         if matches!(order.status, OrderStatus::Rejected | OrderStatus::Cancelled) {
             let reason = record["status_message"]
@@ -510,10 +531,16 @@ pub fn merge_positions(
             continue;
         };
         let qty = number(&row["quantity"]);
-        *quantity.entry(symbol.into()).or_default() += qty;
+        let held = quantity.get(symbol).copied().unwrap_or(0.0);
         if qty > 0.0 {
             *cost.entry(symbol.into()).or_default() += qty * number(&row["average_price"]);
+        } else if qty < 0.0 && held > 0.0 {
+            // A same-day sell: the shares sold take their share of the cost
+            // basis with them, so the remaining shares keep their average.
+            let total = cost.entry(symbol.into()).or_default();
+            *total *= (held + qty).max(0.0) / held;
         }
+        quantity.insert(symbol.into(), held + qty);
         let price = number(&row["last_price"]);
         if price > 0.0 || !last_price.contains_key(symbol) {
             last_price.insert(symbol.into(), price);
@@ -751,6 +778,24 @@ mod tests {
         assert_eq!(infy.quantity, 15.0);
         assert!((infy.avg_cost - (12.0 * 1500.0 + 3.0 * 1580.0) / 15.0).abs() < 1e-9);
         assert_eq!(infy.market_value, 15.0 * 1600.0);
+    }
+
+    #[test]
+    fn a_partial_same_day_sell_keeps_the_average_cost() {
+        let holdings = json!([
+            {"tradingsymbol": "INFY", "exchange": "NSE", "quantity": 10, "t1_quantity": 0,
+             "average_price": 1500.0, "last_price": 1600.0}
+        ]);
+        let positions = json!({"net": [
+            {"tradingsymbol": "INFY", "exchange": "NSE", "product": "CNC", "quantity": -4,
+             "average_price": 0, "last_price": 1600.0}
+        ]});
+
+        let infy = merge_positions(&holdings, &positions, "NSE")["INFY"].clone();
+
+        assert_eq!(infy.quantity, 6.0);
+        assert!((infy.avg_cost - 1500.0).abs() < 1e-9);
+        assert!((infy.unrealized_pnl - 600.0).abs() < 1e-9);
     }
 
     #[test]

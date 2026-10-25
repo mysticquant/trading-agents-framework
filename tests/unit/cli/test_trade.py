@@ -90,7 +90,9 @@ async def test_trading_loop_wiring(tmp_path):
     assert loop.mode == "dry-run"
     assert loop.universe == ["INFY", "TCS"]
     assert loop.guardrails.max_orders_per_day == 3
-    assert loop.journal_path == tmp_path / "kite-journal.jsonl"
+    # Separate per mode, so dry/paper runs never share live guardrail state.
+    assert loop.journal_path == tmp_path / "kite-dry-run-journal.jsonl"
+    assert loop.state_store._path == tmp_path / "kite-dry-run-state.json"
     # US-only evidence sources aren't used for NSE symbols.
     assert loop.orchestrator.evidence_provider is None
 

@@ -27,6 +27,7 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 import math
 import re
 import time as time_module
@@ -47,6 +48,8 @@ from trading_agents.contracts.broker import (
     Position,
 )
 from trading_agents.contracts.market import MarketBar, Timeframe
+
+logger = logging.getLogger(__name__)
 
 API_BASE = "https://api.kite.trade"
 LOGIN_URL = "https://kite.zerodha.com/connect/login"
@@ -407,9 +410,14 @@ class KiteBrokerAdapter:
                 continue
             symbol = row["tradingsymbol"]
             qty = float(row.get("quantity") or 0)
-            quantity[symbol] = quantity.get(symbol, 0.0) + qty
+            held = quantity.get(symbol, 0.0)
             if qty > 0:
                 cost[symbol] = cost.get(symbol, 0.0) + qty * float(row.get("average_price") or 0)
+            elif qty < 0 and held > 0:
+                # A same-day sell: the shares sold take their share of the cost
+                # basis with them, so the remaining shares keep their average.
+                cost[symbol] = cost.get(symbol, 0.0) * max(0.0, held + qty) / held
+            quantity[symbol] = held + qty
             last_price[symbol] = float(row.get("last_price") or last_price.get(symbol, 0))
 
         result = {}
@@ -473,7 +481,24 @@ class KiteBrokerAdapter:
                 raise OrderRejectedError(f"Kite refused the order: {exc}.{hint}") from exc
             raise
 
-        record = await self._wait_for_ack(str(placed["order_id"]))
+        order_id = str(placed["order_id"])
+        try:
+            record = await self._wait_for_ack(order_id)
+        except BrokerError as exc:
+            # Kite has accepted the order; only the status check failed. Never
+            # turn that into "not placed" — return it with its id so it can be
+            # tracked (and isn't sent again).
+            logger.warning("Kite accepted order %s but its status check failed: %s", order_id, exc)
+            return Order(
+                order_id=order_id,
+                ticker=request.ticker.upper(),
+                side=request.side,
+                quantity=float(quantity),
+                order_type=request.order_type,
+                limit_price=request.limit_price if request.order_type == "limit" else None,
+                status="pending",
+                submitted_at=datetime.now(UTC),
+            )
         order = record_to_order(record)
         if order.status in ("rejected", "cancelled"):
             raise OrderRejectedError(

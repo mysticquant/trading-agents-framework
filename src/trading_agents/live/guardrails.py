@@ -4,14 +4,18 @@ never enlarge one, whatever the LLM said.
 
 - Kill switch: while the kill-switch file exists, no order is sent.
 - Daily drawdown: once equity falls the configured fraction below the
-  day's starting equity, trading stops for the rest of that day.
+  day's starting equity, trading stops for the rest of that day. The
+  starting equity is the equity recorded at the end of the previous cycle,
+  so a loss between once-a-day cycles counts (for the very first cycle on
+  an account it is that cycle's own equity).
 - Orders per day: a cap on orders sent per trading day.
 - Order size: a buy may not exceed the configured fraction of equity.
   Sells are not size-capped (they reduce exposure, and capping them could
   trap a position); the broker still refuses selling more than is held.
 
 The per-day counters live in `DailyState`, persisted by `StateStore` so a
-restart mid-day doesn't reset them.
+restart mid-day doesn't reset them. Each state records the account it
+belongs to; a state saved for a different account is ignored.
 """
 
 import json
@@ -40,27 +44,47 @@ class DailyState:
     starting_equity: float
     orders_sent: int = 0
     halted_reason: str | None = None
+    account: str | None = None
+    # Equity at the end of the latest cycle: the next day's starting equity.
+    last_equity: float | None = None
 
 
 class StateStore:
-    """Persists `DailyState` as JSON. A state from an earlier day is
-    discarded, so each trading day starts fresh."""
+    """Persists the latest `DailyState` as JSON. `load` returns it only for
+    the same day and account; an earlier day's state still supplies the
+    next day's drawdown baseline via `previous_equity`."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
 
-    def load(self, trading_day: date) -> DailyState | None:
+    def _read(self, account: str | None) -> dict | None:
         if not self._path.exists():
             return None
         raw = json.loads(self._path.read_text(encoding="utf-8"))
-        if raw.get("trading_day") != trading_day.isoformat():
+        return raw if raw.get("account") == account else None
+
+    def load(self, trading_day: date, account: str | None = None) -> DailyState | None:
+        raw = self._read(account)
+        if raw is None or raw.get("trading_day") != trading_day.isoformat():
             return None
+        last_equity = raw.get("last_equity")
         return DailyState(
             trading_day=trading_day,
             starting_equity=float(raw["starting_equity"]),
             orders_sent=int(raw["orders_sent"]),
             halted_reason=raw.get("halted_reason"),
+            account=account,
+            last_equity=float(last_equity) if last_equity is not None else None,
         )
+
+    def previous_equity(self, trading_day: date, account: str | None = None) -> float | None:
+        """Equity at the end of the last cycle before `trading_day` for this
+        account, if one was recorded."""
+        raw = self._read(account)
+        if raw is None or raw.get("trading_day", "") >= trading_day.isoformat():
+            return None
+        equity = raw.get("last_equity", raw.get("starting_equity"))
+        return float(equity) if equity is not None else None
 
     def save(self, state: DailyState) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,8 +116,8 @@ def halt_reason(guardrails: Guardrails, state: DailyState, equity: float) -> str
     if equity < floor:
         state.halted_reason = (
             f"daily drawdown limit hit: equity {equity:,.2f} is below "
-            f"{floor:,.2f} ({guardrails.max_daily_drawdown_pct:.0%} under the day's "
-            f"starting {state.starting_equity:,.2f})"
+            f"{floor:,.2f} ({guardrails.max_daily_drawdown_pct:.0%} under the starting "
+            f"equity of {state.starting_equity:,.2f})"
         )
         return state.halted_reason
     return None

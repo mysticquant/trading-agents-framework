@@ -174,21 +174,31 @@ shrink or block an order) and configurable in `.env`:
 |---|---|---|
 | Max size of one buy | 5% of equity (whole shares) | `LIVE_MAX_ORDER_PCT` |
 | Max orders sent per day | 10 | `LIVE_MAX_ORDERS_PER_DAY` |
-| Stop trading for the day after a drawdown from the day's starting equity | 2% | `LIVE_MAX_DAILY_DRAWDOWN_PCT` |
+| Stop trading for the day after a drawdown from the equity at the end of the previous cycle | 2% | `LIVE_MAX_DAILY_DRAWDOWN_PCT` |
 | Kill switch: while this file exists, nothing is sent | `KILL_SWITCH` | `LIVE_KILL_SWITCH_PATH` |
 
 These come on top of the agents' own limits (the risk manager's 10%
 per-ticker position cap and the portfolio manager's cash check). Sells
 are not size-capped, since they reduce exposure. The kill switch is
 checked before every order, so creating the file mid-cycle stops the
-orders not yet sent. The day's counters are saved under `data/live/`, so
-restarting the loop doesn't reset them.
+orders not yet sent. The counters and the drawdown baseline are saved
+under `data/live/` per broker, mode, and account, so restarting the loop
+doesn't reset them and a dry or paper run never affects a live one.
 
-Every cycle appends one JSON line to `data/live/<broker>-journal.jsonl`:
+Every cycle appends one JSON line to `data/live/<broker>-<mode>-journal.jsonl`:
 each decision, any guardrail that trimmed or blocked it, and the order's
-outcome. Days with no bar dated today (holidays) are skipped, as are
-tickers whose data is stale. An IB connection or a Kite token that has
-expired skips that day's cycle; for Kite, run `kite-login` each morning.
+outcome. If a send fails in a way that leaves it unclear whether the broker
+took the order (a timeout, a dropped connection), that order is journaled as
+`unknown` and nothing more is sent that cycle; check the broker before
+re-running. An order the broker accepted is always journaled with its order
+id, even if the follow-up status check failed.
+
+Days with no bar dated today (holidays) are skipped, as are tickers whose
+data is stale, and so is a cycle that starts more than 15 minutes late
+(e.g. the machine slept through the decision time), so it never trades on
+a stale decision. An IB connection or a Kite token that has expired skips
+that day's cycle; for Kite, run `kite-login` each morning. A restarted
+`execd` is detected and reconnected (and re-checked) on the next cycle.
 
 Known gaps: Kite symbols run on technical analysis only (the evidence
 sources are US-centric), and there is no market-holiday calendar beyond

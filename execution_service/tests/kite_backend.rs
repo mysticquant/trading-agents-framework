@@ -361,3 +361,27 @@ async fn cancel_only_touches_open_orders() {
     kite.cancel_order("1").await.unwrap();
     kite.cancel_order("2").await.unwrap();
 }
+
+#[tokio::test]
+async fn an_accepted_order_keeps_its_id_when_the_status_check_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok(json!({"order_id": "250101000000001"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/orders/250101000000001"))
+        .respond_with(kite_error(429, "NetworkException", "Too many requests"))
+        .mount(&server)
+        .await;
+
+    let order = backend(&server, true)
+        .await
+        .place_order(&buy(9.7))
+        .await
+        .expect("an accepted order must not be reported as an error");
+
+    assert_eq!(order.order_id, "250101000000001");
+    assert_eq!(order.status, OrderStatus::Pending);
+    assert_eq!(order.quantity, 9.0);
+}

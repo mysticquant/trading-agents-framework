@@ -177,8 +177,10 @@ async def build_trading_loop(settings: Settings, mode: Mode) -> LiveTradingLoop:
         guardrails=build_guardrails(settings),
         mode=mode,
         schedule=build_schedule(settings),
-        state_store=StateStore(state_dir / f"{settings.live_broker}-state.json"),
-        journal_path=state_dir / f"{settings.live_broker}-journal.jsonl",
+        # Per broker and mode: a dry or paper run must never set the drawdown
+        # baseline or use up the order limit of a live run (and vice versa).
+        state_store=StateStore(state_dir / f"{settings.live_broker}-{mode}-state.json"),
+        journal_path=state_dir / f"{settings.live_broker}-{mode}-journal.jsonl",
     )
 
 
