@@ -7,10 +7,10 @@ Researcher, a Trader, a Risk Manager, and a Portfolio Manager collaborate
 on each trading decision.
 
 It has a fully testable Python core, a simulated (paper) broker with a
-backtest runner, adapters for Interactive Brokers and Zerodha Kite, and a
+backtest runner, adapters for Interactive Brokers and Zerodha Kite, a
 guarded live trading loop that runs in dry-run mode unless told
-otherwise. A low-latency Rust/C++ execution service is future work — see
-"Out of scope" below.
+otherwise, and an optional Rust execution service (`execd`) that can sit
+between the loop and the broker.
 
 ## Setup
 
@@ -194,6 +194,50 @@ Known gaps: Kite symbols run on technical analysis only (the evidence
 sources are US-centric), and there is no market-holiday calendar beyond
 the "no bar today" check.
 
+## Rust execution service (`execd`)
+
+`execution_service/` is a Rust daemon that exposes the broker operations
+(balance, positions, orders, history) over newline-delimited JSON on a
+loopback TCP port. The live loop reaches it through
+`ExecutionServiceAdapter` with `LIVE_BROKER=execd`. Backends:
+
+- `paper`: a simulated ledger with immediate fills (whole shares,
+  configurable slippage and commission).
+- `kite`: Zerodha Kite Connect over one persistent HTTPS connection pool,
+  with the same rules as the Python Kite adapter (orders refused unless
+  started with `--allow-live`, `market_protection=-1`, whole shares,
+  static-IP hint, rate limits, chunked history).
+
+```powershell
+cd execution_service
+cargo build --release
+$env:EXECD_TOKEN = "<at least 16 random characters>"
+.\target\release\execd --backend paper              # simulated
+.\target\release\execd --backend kite               # Kite reads only
+.\target\release\execd --backend kite --allow-live  # Kite real orders
+```
+
+`--backend kite` reads `KITE_API_KEY` / `KITE_ACCESS_TOKEN` from the
+environment and checks the session before it starts listening. Then in
+`.env`: `LIVE_BROKER=execd`, the same `EXECD_TOKEN`, and
+`EXECD_MARKET=nse` (Kite symbols) or `us`.
+
+Safety:
+- It only listens on loopback, and every request must carry the token,
+  compared in constant time.
+- Real orders need the daemon's `--allow-live` **and** the loop's two
+  opt-ins.
+- The Python adapter checks the daemon rather than trusting it: paper mode
+  refuses unless the daemon runs `paper`, and live mode refuses unless it
+  runs `kite` with orders enabled. Dry runs block orders before they leave
+  Python.
+
+On latency: at the default once-a-day cadence, the LLM calls take seconds
+and orders are a handful per day, so `execd` makes no measurable speed
+difference. What it adds is an order path isolated from the Python
+process, a persistent broker connection, and an independent safety gate.
+It is also the seam for any future higher-frequency strategy.
+
 ## Architecture
 
 - `contracts/` — pydantic data contracts shared by every layer (market
@@ -220,6 +264,8 @@ the "no bar today" check.
 - `live/` — `LiveTradingLoop` (scheduling, modes, journal) and
   `guardrails.py` (order limits, drawdown halt, kill switch, persisted
   daily state); wired up by `cli/trade.py`.
+- `execution_service/` — the Rust `execd` daemon (see below);
+  `brokers/execution_service.py` is the Python adapter that talks to it.
 - `backtest/` — `BacktestRunner` (drives the orchestrator day-by-day
   against `PaperBrokerAdapter`) and `metrics.py` (return, Sharpe, max
   drawdown, win rate).
@@ -262,9 +308,10 @@ so fundamentals are close to, but not exactly, what was known at the time.
 
 ## Out of scope for this phase (future work)
 
-- A **Rust/C++ low-latency execution service** for live order routing,
-  reached from Python over gRPC or a local socket/queue, implementing the
-  same `BrokerAdapter` Protocol.
+- **IB in the Rust execution service.** `execd` fronts Kite (and a paper
+  ledger); IB stays on the Python adapter, since reimplementing TWS's
+  versioned binary socket protocol in Rust can't be verified without a
+  live TWS.
 - **Further LLM providers.** Claude and local Ollama models are
   supported; `LLMClient` is a `Protocol`, so another implementation can be
   added without touching `agents/` or `orchestration/`.

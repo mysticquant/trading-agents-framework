@@ -4,14 +4,15 @@ could send real orders without both explicit opt-ins.
 
 How each mode reaches the broker:
 
-| mode    | IB                                         | Kite                         |
-|---------|--------------------------------------------|------------------------------|
-| dry-run | read-only connection (cannot place orders) | orders disabled              |
-| paper   | paper accounts only (verified on connect)  | refused: Kite has no paper   |
-| live    | live allowed; needs ALLOW_LIVE_TRADING     | orders on; needs ALLOW_LIVE… |
+| mode    | IB                         | Kite                       | execd (Rust service)         |
+|---------|----------------------------|----------------------------|------------------------------|
+| dry-run | read-only connection       | orders disabled            | orders blocked client-side   |
+| paper   | paper accounts only        | refused: Kite has no paper | daemon must run `paper`      |
+| live    | needs ALLOW_LIVE_TRADING   | needs ALLOW_LIVE_TRADING   | daemon must run `kite` with  |
+|         |                            |                            | --allow-live, + ALLOW_LIVE…  |
 """
 
-from datetime import time
+from datetime import date, time
 from zoneinfo import ZoneInfo
 
 from trading_agents.brokers.base import BrokerAdapter
@@ -21,6 +22,7 @@ from trading_agents.brokers.kite import (
     KiteRestClient,
 )
 from trading_agents.config.settings import ConfigurationError, Settings
+from trading_agents.contracts.market import MarketBar, Timeframe
 from trading_agents.contracts.trading import ExecutionCosts
 from trading_agents.data.cache import CachedDataProvider, ParquetCache
 from trading_agents.data.providers.base import HistoricalDataProvider
@@ -28,10 +30,29 @@ from trading_agents.data.providers.yfinance_provider import YFinanceProvider
 from trading_agents.live.guardrails import Guardrails, StateStore
 from trading_agents.live.loop import LiveTradingLoop, Mode, Schedule
 
-_EXCHANGE = {
-    "ib": (ZoneInfo("America/New_York"), time(15, 30)),
-    "kite": (ZoneInfo("Asia/Kolkata"), time(15, 0)),
-}
+_US = (ZoneInfo("America/New_York"), time(15, 30))
+_NSE = (ZoneInfo("Asia/Kolkata"), time(15, 0))
+
+
+def _market(settings: Settings) -> str:
+    if settings.live_broker == "execd":
+        return settings.execd_market
+    return "us" if settings.live_broker == "ib" else "nse"
+
+
+class _NseYFinanceProvider:
+    """yfinance lists NSE stocks as "<SYMBOL>.NS"; Kite and execd use the bare
+    symbol. Without the suffix yfinance can return a different listing
+    (e.g. INFY is Infosys' US ADR), so translate both ways."""
+
+    def __init__(self, inner: HistoricalDataProvider) -> None:
+        self._inner = inner
+
+    async def get_bars(
+        self, ticker: str, start: date, end: date, timeframe: Timeframe
+    ) -> list[MarketBar]:
+        bars = await self._inner.get_bars(f"{ticker}.NS", start, end, timeframe)
+        return [bar.model_copy(update={"ticker": ticker}) for bar in bars]
 
 
 def require_live_opt_in(settings: Settings, mode: Mode) -> None:
@@ -64,6 +85,9 @@ def build_live_broker(
         data = CachedDataProvider(YFinanceProvider(), ParquetCache(settings.data_cache_dir))
         return broker, data
 
+    if settings.live_broker == "execd":
+        return _build_execd(settings, mode)
+
     if mode == "paper":
         raise ConfigurationError(
             "Kite has no paper-trading accounts. Use --mode dry-run to run the loop "
@@ -78,8 +102,32 @@ def build_live_broker(
     return KiteBrokerAdapter(client, allow_live=mode == "live", historical=historical), historical
 
 
+def _build_execd(settings: Settings, mode: Mode) -> tuple[BrokerAdapter, HistoricalDataProvider]:
+    from trading_agents.brokers.execution_service import ExecutionServiceAdapter
+
+    if settings.execd_token is None:
+        raise ConfigurationError("EXECD_TOKEN must be set (the token execd was started with).")
+    yfinance: HistoricalDataProvider = CachedDataProvider(
+        YFinanceProvider(), ParquetCache(settings.data_cache_dir)
+    )
+    if settings.execd_market == "nse":
+        yfinance = _NseYFinanceProvider(yfinance)
+    adapter = ExecutionServiceAdapter(
+        token=settings.execd_token.get_secret_value(),
+        host=settings.execd_host,
+        port=settings.execd_port,
+        # Checked against the daemon on connect, not taken on trust.
+        require_backend={"paper": "paper", "live": "kite"}.get(mode),
+        require_orders_enabled=mode == "live",
+        block_orders=mode == "dry-run",
+        # The kite backend serves its own history; the paper backend has none.
+        fallback_historical=yfinance,
+    )
+    return adapter, adapter
+
+
 def build_schedule(settings: Settings) -> Schedule:
-    timezone, default_time = _EXCHANGE[settings.live_broker]
+    timezone, default_time = _US if _market(settings) == "us" else _NSE
     if not settings.live_decision_time:
         return Schedule(timezone, default_time)
     try:
@@ -117,10 +165,8 @@ async def build_trading_loop(settings: Settings, mode: Mode) -> LiveTradingLoop:
         role_registry=role_registry,
         execution_costs=ExecutionCosts(),
         # The evidence sources (yfinance fundamentals, SEC EDGAR) cover US
-        # listings; Kite's NSE symbols run on technicals alone for now.
-        evidence_provider=build_evidence_provider(settings)
-        if settings.live_broker == "ib"
-        else None,
+        # listings; NSE symbols run on technicals alone for now.
+        evidence_provider=build_evidence_provider(settings) if _market(settings) == "us" else None,
     )
     state_dir = settings.live_state_dir
     return LiveTradingLoop(
