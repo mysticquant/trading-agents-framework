@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     kite_api_secret: SecretStr | None = None
     kite_access_token: SecretStr | None = None
 
+    # Live trading loop (`trading-agents trade`). Real-money orders need BOTH
+    # `--mode live` and allow_live_trading=true. The decision time is
+    # exchange-local "HH:MM"; empty means 15:30 New York for IB and 15:00
+    # Mumbai for Kite (both 30 minutes before the close).
+    live_broker: Literal["ib", "kite"] = "ib"
+    allow_live_trading: bool = False
+    live_decision_time: str | None = None
+    live_max_order_pct: float = Field(default=0.05, gt=0.0, le=1.0)
+    live_max_orders_per_day: int = Field(default=10, ge=0)
+    live_max_daily_drawdown_pct: float = Field(default=0.02, gt=0.0, le=1.0)
+    live_kill_switch_path: Path = Path("KILL_SWITCH")
+    live_state_dir: Path = Path("data/live")
+
     # SEC EDGAR filings (point-in-time news evidence) are fetched only when
     # this is set; SEC requires it to name you with a contact email.
     sec_user_agent: str | None = None

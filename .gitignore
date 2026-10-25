@@ -9,3 +9,6 @@ data/cache/
 *.egg-info/
 dist/
 build/
+# Live-trading journals/state (private) and the kill-switch file
+data/live/
+KILL_SWITCH
