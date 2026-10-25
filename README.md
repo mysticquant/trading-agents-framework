@@ -16,7 +16,7 @@ service are future phases — see "Out of scope" below.
 ```powershell
 python -m venv .venv
 .venv\Scripts\pip install -e ".[dev]"
-copy .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally SEC_USER_AGENT)
+copy .env.example .env   # then fill in ANTHROPIC_API_KEY, or set LLM_PROVIDER=ollama
 ```
 
 ## Running tests
@@ -27,14 +27,41 @@ copy .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally SEC_US
 .venv\Scripts\mypy src
 ```
 
-`tests/integration/test_live_llm_smoke.py` is excluded by default (see
-`addopts` in `pyproject.toml`). It makes one real, billed call to the
-Anthropic API. Run it explicitly once you have a real `ANTHROPIC_API_KEY`
+Two live smoke tests are excluded by default (see `addopts` in
+`pyproject.toml`). `test_live_llm_smoke.py` makes one real, billed call to
+the Anthropic API (needs `ANTHROPIC_API_KEY` in `.env`);
+`test_live_ollama_smoke.py` makes one call to a local Ollama server (needs
+the model pulled):
+
+```powershell
+.venv\Scripts\pytest -m live_llm      # Claude
+.venv\Scripts\pytest -m live_ollama   # local Ollama model
+```
+
+## Choosing the LLM
+
+Agents run on Claude by default. To run them on a local model instead,
+install [Ollama](https://ollama.com), pull a model, and set the provider
 in `.env`:
 
 ```powershell
-.venv\Scripts\pytest -m live_llm
+ollama pull llama3.1:8b
+# .env
+LLM_PROVIDER=ollama
+OLLAMA_MODEL=llama3.1:8b        # used for every role
 ```
+
+No API key is needed with Ollama. `LLM_ROLE_OVERRIDES` still works and
+takes Ollama model names, e.g. `{"researcher": "qwen3:32b"}` to give the
+high-stakes roles a larger model. Before a run the CLI checks that the
+server is reachable and every configured model is pulled.
+
+Local models are less reliable at structured output than Claude, so the
+Ollama client constrains generation to each agent's JSON schema, retries
+once with the validation error when the output still doesn't fit, and
+caps in-flight requests (`OLLAMA_MAX_CONCURRENCY`, default 2) so a local
+server isn't flooded. Expect slower runs on CPU-only machines
+(`OLLAMA_TIMEOUT_SECONDS`, default 300).
 
 ## Running a backtest
 
@@ -53,9 +80,9 @@ touches a real brokerage account.
 - `contracts/` — pydantic data contracts shared by every layer (market
   bars, analyst reports, trade proposals, orders, portfolio state,
   backtest results).
-- `llm/` — the `LLMClient` abstraction, structured (tool-use) output
-  parsing, per-role model config, and prompt templates under
-  `llm/prompts/*.md`.
+- `llm/` — the `LLMClient` abstraction with Claude (`client.py`) and
+  Ollama (`ollama_client.py`) implementations, structured output parsing,
+  per-role model config, and prompt templates under `llm/prompts/*.md`.
 - `agents/` — one module per agent role. Each agent's LLM output is a
   narrow, role-specific pydantic model; deterministic fields (timestamps,
   echoed inputs, hard risk/cash limits) are filled in by Python, not the
@@ -121,8 +148,6 @@ so fundamentals are close to, but not exactly, what was known at the time.
   same `BrokerAdapter` Protocol.
 - Live trading of any kind — everything today runs against
   `PaperBrokerAdapter`.
-- **Support for LLM providers other than Anthropic.** `LLMClient` is a
-  `Protocol` (same shape as `BrokerAdapter`), so a second implementation
-  (e.g. OpenAI, or a local model via Ollama) could be added without
-  touching `agents/` or `orchestration/`. Phase 1 deliberately shipped
-  Claude-only; this is tracked as future scope, not a regression.
+- **Further LLM providers.** Claude and local Ollama models are
+  supported; `LLMClient` is a `Protocol`, so another implementation can be
+  added without touching `agents/` or `orchestration/`.

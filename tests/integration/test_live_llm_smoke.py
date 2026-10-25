@@ -19,7 +19,8 @@ pytestmark = pytest.mark.live_llm
 
 
 async def test_screener_agent_against_the_real_anthropic_api():
-    settings = Settings()
+    settings = Settings(llm_provider="anthropic")
+    assert settings.anthropic_api_key is not None
     llm_client = AnthropicLLMClient(api_key=settings.anthropic_api_key.get_secret_value())
     agent = ScreenerAgent(llm_client)
 
