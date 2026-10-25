@@ -327,7 +327,9 @@ async def test_paper_brokers_are_marked_at_todays_close_before_the_balance(env, 
 
     await _loop(env, broker=broker, data=data, decisions=[]).run_once()
 
-    assert events == [("mark", "AAPL", 123.0), ("mark", "MSFT", 100.0), "balance"]
+    # Marked first; the balance is read again after the cycle for the
+    # next day's drawdown baseline.
+    assert events[:3] == [("mark", "AAPL", 123.0), ("mark", "MSFT", 100.0), "balance"]
 
 
 # --- scheduling loop ------------------------------------------------------------
@@ -359,3 +361,84 @@ async def test_run_forever_waits_for_the_decision_time_then_runs(env):
 
 def _journal_lines(env) -> list[str]:
     return env["journal"].read_text().splitlines() if env["journal"].exists() else []
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+async def test_an_unexpected_send_error_is_journaled_as_possibly_live_and_stops_sending(env):
+    class FlakyBroker(FakeBroker):
+        async def place_order(self, request):
+            raise BrokerError("execution service call 'place_order' timed out")
+
+    broker = FlakyBroker()
+
+    report = await _loop(env, broker=broker).run_once()
+
+    first, second = report.decisions
+    assert first["outcome"].startswith("unknown:")
+    assert "may have reached the broker" in first["outcome"]
+    # Nothing more is sent on an unknown state, but it's still journaled.
+    assert second["outcome"] == "not sent: the outcome of the AAPL order is unknown"
+    assert any("timed out" in e for e in report.errors)
+    assert len(_journal(env)) == 1  # the cycle still journaled
+
+
+async def test_drawdown_counts_losses_since_the_previous_days_cycle(env):
+    yesterday = TODAY - timedelta(days=1)
+    env["store"].save(
+        DailyState(trading_day=yesterday, starting_equity=100_000.0, last_equity=100_000.0)
+    )
+    broker = FakeBroker(equity=97_500.0)  # -2.5% overnight
+    loop = _loop(env, broker=broker)
+
+    report = await loop.run_once()
+
+    assert "daily drawdown limit" in report.skipped_reason
+    assert broker.placed == [] and loop.orchestrator.calls == []
+
+
+async def test_ending_equity_becomes_the_next_days_baseline(env):
+    broker = FakeBroker(equity=50_000.0)
+    await _loop(env, broker=broker, decisions=[]).run_once()
+    broker.equity = 51_000.0  # e.g. marked up after the cycle
+
+    await _loop(env, broker=broker, decisions=[]).run_once()
+
+    state = env["store"].load(TODAY)
+    assert state.starting_equity == 50_000.0  # first-ever cycle: its own equity
+    assert state.last_equity == 51_000.0
+    assert env["store"].previous_equity(TODAY + timedelta(days=1)) == 51_000.0
+
+
+async def test_state_from_another_account_is_ignored(env):
+    env["store"].save(
+        DailyState(trading_day=TODAY, starting_equity=1_000.0, orders_sent=10, account="DU111")
+    )
+    broker = FakeBroker()
+    broker.account = "DU222"
+
+    await _loop(env, broker=broker).run_once()
+
+    assert len(broker.placed) == 2  # not blocked by DU111's order count
+    assert env["store"].load(TODAY, "DU222").starting_equity == 100_000.0
+
+
+async def test_a_cycle_woken_long_after_its_time_is_skipped(env):
+    clock = {"now": datetime(2026, 10, 26, 15, 0, tzinfo=NY)}
+
+    async def laptop_sleep(seconds: float) -> None:
+        if _journal_lines(env):
+            raise KeyboardInterrupt
+        clock["now"] = datetime(2026, 10, 26, 19, 0, tzinfo=NY)  # woke after the close
+
+    loop = _loop(env, mode="paper")
+    loop._now = lambda: clock["now"]
+    loop._sleep = laptop_sleep
+
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_forever()
+
+    (entry,) = _journal(env)
+    assert "210 min after the 15:30 decision time" in entry["skipped_reason"]
+    assert loop.orchestrator.calls == [] and loop.broker.placed == []

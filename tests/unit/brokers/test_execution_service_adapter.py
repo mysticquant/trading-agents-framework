@@ -57,7 +57,10 @@ class FakeExecd:
             else:
                 handler = self.handlers[request["method"]]
                 try:
-                    response = {"id": request["id"], "result": handler(request["params"])}
+                    result = handler(request["params"])
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    response = {"id": request["id"], "result": result}
                 except _Error as err:
                     response = {
                         "id": request["id"],
@@ -257,4 +260,37 @@ async def test_a_closed_connection_raises_and_marks_disconnected(execd):
 
     with pytest.raises(BrokerError):
         await adapter.get_account_balance()
+    assert not adapter.is_connected()
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+async def test_orders_get_a_longer_timeout_than_other_calls(execd):
+    async def slow(params):
+        await asyncio.sleep(0.5)  # like a slow Kite POST plus status polling
+        return {**_ORDER, "quantity": params["quantity"]}
+
+    execd.handlers["place_order"] = slow
+    execd.handlers["get_account_balance"] = slow
+    adapter = ExecutionServiceAdapter(
+        token=TOKEN, port=execd.port, timeout_seconds=0.2, order_timeout_seconds=5
+    )
+    await adapter.connect()
+
+    order = await adapter.place_order(_buy())  # waited out, not abandoned
+    assert order.order_id == "1"
+
+    with pytest.raises(BrokerError, match="failed"):
+        await adapter.get_account_balance()
+
+
+async def test_a_daemon_restart_is_noticed_so_the_loop_reconnects(execd):
+    adapter = _adapter(execd)
+    await adapter.connect()
+    assert adapter.is_connected()
+
+    await execd.stop()  # e.g. restarted with a new Kite token
+    await asyncio.sleep(0.05)
+
     assert not adapter.is_connected()

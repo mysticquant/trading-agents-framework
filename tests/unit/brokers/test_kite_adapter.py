@@ -505,3 +505,62 @@ async def test_kite_check_needs_an_access_token():
 
     with pytest.raises(ConfigurationError, match="kite-login"):
         await kite_check(Settings(kite_api_key="key", _env_file=None))
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+async def test_an_accepted_order_keeps_its_id_when_the_status_check_fails():
+    fake = FakeKite(
+        {
+            ("POST", "/orders/regular"): ok({"order_id": "250101000000001"}),
+            ("GET", "/orders/250101000000001"): error(429, "NetworkException", "Too many requests"),
+        }
+    )
+    adapter = await _adapter(fake, allow_live=True)
+
+    order = await adapter.place_order(_buy())
+
+    assert order.order_id == "250101000000001"
+    assert order.status == "pending"
+    assert order.quantity == 9.0
+
+
+async def test_a_partial_same_day_sell_keeps_the_average_cost():
+    fake = FakeKite(
+        {
+            ("GET", "/portfolio/holdings"): ok(
+                [
+                    {
+                        "tradingsymbol": "INFY",
+                        "exchange": "NSE",
+                        "quantity": 10,
+                        "t1_quantity": 0,
+                        "average_price": 1500.0,
+                        "last_price": 1600.0,
+                    }
+                ]
+            ),
+            ("GET", "/portfolio/positions"): ok(
+                {
+                    "net": [
+                        {
+                            "tradingsymbol": "INFY",
+                            "exchange": "NSE",
+                            "product": "CNC",
+                            "quantity": -4,
+                            "average_price": 0,
+                            "last_price": 1600.0,
+                        }
+                    ]
+                }
+            ),
+        }
+    )
+    adapter = await _adapter(fake)
+
+    infy = (await adapter.get_positions())["INFY"]
+
+    assert infy.quantity == 6.0
+    assert infy.avg_cost == pytest.approx(1500.0)
+    assert infy.unrealized_pnl == pytest.approx(6 * 100.0)

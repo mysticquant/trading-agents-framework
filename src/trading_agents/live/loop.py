@@ -32,7 +32,7 @@ from trading_agents.brokers.base import (
     BrokerError,
     OrderRejectedError,
 )
-from trading_agents.contracts.broker import OrderRequest
+from trading_agents.contracts.broker import AccountBalance, OrderRequest, Position
 from trading_agents.contracts.market import MarketBar
 from trading_agents.contracts.portfolio import PortfolioState
 from trading_agents.data.providers.base import HistoricalDataProvider
@@ -90,6 +90,12 @@ class CycleReport:
         )
 
 
+def _account_of(broker: BrokerAdapter) -> str | None:
+    """The account id a connected broker reports, if it exposes one."""
+    account = getattr(broker, "account", None) or getattr(broker, "user_id", None)
+    return str(account) if account else None
+
+
 class LiveTradingLoop:
     def __init__(
         self,
@@ -104,6 +110,7 @@ class LiveTradingLoop:
         state_store: StateStore,
         journal_path: Path,
         lookback_days: int = 150,
+        max_lateness: timedelta = timedelta(minutes=15),
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -117,6 +124,7 @@ class LiveTradingLoop:
         self.state_store = state_store
         self.journal_path = journal_path
         self.lookback_days = lookback_days
+        self.max_lateness = max_lateness
         self._now = now
         self._sleep = sleep
 
@@ -125,11 +133,27 @@ class LiveTradingLoop:
             next_at = self.schedule.next_run(self._now())
             logger.info("Next decision cycle at %s", next_at.isoformat())
             await self._wait_until(next_at)
+            late_by = self._now() - next_at
+            if late_by > self.max_lateness:
+                # E.g. the machine slept through the decision time: deciding
+                # now would trade on a stale close, possibly after the close.
+                self._skip_late(next_at, late_by)
+                continue
             try:
                 await self.run_once()
             except Exception:
                 # Never let one bad day stop the loop; the next run retries.
                 logger.exception("Decision cycle crashed")
+
+    def _skip_late(self, scheduled: datetime, late_by: timedelta) -> None:
+        local = scheduled.astimezone(self.schedule.timezone)
+        report = CycleReport(started_at=self._now(), mode=self.mode, trading_day=local.date())
+        report.skipped_reason = (
+            f"woke {int(late_by.total_seconds() // 60)} min after the {local:%H:%M} decision "
+            f"time (more than {int(self.max_lateness.total_seconds() // 60)} min late); "
+            "skipped rather than trade on a stale decision"
+        )
+        self._journal(report)
 
     async def _wait_until(self, moment: datetime) -> None:
         while (remaining := (moment - self._now()).total_seconds()) > 0:
@@ -173,14 +197,44 @@ class LiveTradingLoop:
             report.skipped_reason = f"broker unavailable: {exc}"
             return
 
-        state = self.state_store.load(report.trading_day) or DailyState(
-            trading_day=report.trading_day, starting_equity=balance.equity
-        )
+        account = _account_of(self.broker)
+        state = self.state_store.load(report.trading_day, account)
+        if state is None:
+            baseline = self.state_store.previous_equity(report.trading_day, account)
+            state = DailyState(
+                trading_day=report.trading_day,
+                starting_equity=baseline if baseline is not None else balance.equity,
+                account=account,
+            )
+        state.last_equity = balance.equity
         self.state_store.save(state)
         if halted := halt_reason(self.guardrails, state, balance.equity):
             self.state_store.save(state)
             report.skipped_reason = halted
             return
+
+        try:
+            await self._decide_and_send(report, now, state, market_data, balance, positions)
+        finally:
+            await self._record_ending_equity(state)
+
+    async def _record_ending_equity(self, state: DailyState) -> None:
+        """Save equity after this cycle's orders: tomorrow's drawdown baseline."""
+        try:
+            state.last_equity = (await self.broker.get_account_balance()).equity
+        except BrokerError as exc:
+            logger.warning("Could not read equity after the cycle: %s", exc)
+        self.state_store.save(state)
+
+    async def _decide_and_send(
+        self,
+        report: CycleReport,
+        now: datetime,
+        state: DailyState,
+        market_data: dict[str, list[MarketBar]],
+        balance: AccountBalance,
+        positions: dict[str, Position],
+    ) -> None:
 
         cycle = await self.orchestrator.run_cycle(
             as_of=now,
@@ -199,6 +253,9 @@ class LiveTradingLoop:
         # what a real run would have been allowed to send without touching
         # the persisted counters.
         limits_state = dataclasses.replace(state) if self.mode == "dry-run" else state
+        # Set once sending must stop for this cycle; later decisions are still
+        # journaled, as not sent, so the journal lists every decision.
+        stop_sending: str | None = None
         for ticker_state in cycle.per_ticker.values():
             if ticker_state.error:
                 report.errors.append(f"{ticker_state.ticker}: {ticker_state.error}")
@@ -214,6 +271,10 @@ class LiveTradingLoop:
                 "rationale": decision.rationale,
             }
             report.decisions.append(entry)
+            if stop_sending:
+                entry["sent_quantity"] = 0.0
+                entry["outcome"] = f"not sent: {stop_sending}"
+                continue
 
             # Checked per order, after the agents have decided, so a kill
             # switch engaged mid-cycle stops every order not yet sent.
@@ -253,7 +314,19 @@ class LiveTradingLoop:
             except BrokerAuthExpiredError as exc:
                 entry["outcome"] = f"not sent: {exc}"
                 report.errors.append(str(exc))
-                break
+                stop_sending = "the broker session expired"
+                continue
+            except BrokerError as exc:
+                # A timeout or dropped connection can happen after the broker
+                # took the order. Record that it may be live, and send nothing
+                # more this cycle rather than stack orders on an unknown state.
+                entry["outcome"] = (
+                    f"unknown: {exc} - the order may have reached the broker; "
+                    "check it there before re-running"
+                )
+                report.errors.append(f"{decision.ticker}: {exc}")
+                stop_sending = f"the outcome of the {decision.ticker} order is unknown"
+                continue
             entry["outcome"] = order.status
             entry["order_id"] = order.order_id
             if order.fill_price is not None:
@@ -298,7 +371,7 @@ class LiveTradingLoop:
             logger.info(
                 "%s %s %s -> %s",
                 entry["action"],
-                entry["sent_quantity"],
+                entry.get("sent_quantity"),
                 entry["ticker"],
                 entry.get("outcome"),
             )
