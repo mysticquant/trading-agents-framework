@@ -19,5 +19,7 @@ Rules:
 - If the evidence is empty, or its `note` says data was unavailable, return
   "neutral" with `confidence` of 0.2 or lower and say so in `summary`. Never
   treat missing data as a signal in either direction.
+- A `coverage_note` only says which sources are missing for this date;
+  judge the evidence that is present on its merits.
 
 Emit your result using the `emit_result` tool.

@@ -7,13 +7,16 @@ History available through yfinance (as of this writing):
   releases requested; reported EPS present for roughly the last 20 years)
 - quarterly income statement / balance sheet: only the last ~5 quarters,
   so margins/leverage are missing for backtest dates more than ~a year back
-- analyst upgrades/downgrades: years
+- analyst upgrades/downgrades: years. Their price targets are stored as
+  issued (not split-adjusted) while yfinance prices are split-adjusted, so
+  targets are rescaled with the ticker's split history (`split_adjust`).
 - headlines (`yf.Search`): only the last few days
 """
 
 import asyncio
 import math
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime
 from typing import Any
 
 import pandas as pd
@@ -111,6 +114,53 @@ def parse_upgrades_downgrades(frame: pd.DataFrame | None) -> list[AnalystAction]
     ]
 
 
+def parse_splits(series: pd.Series | None) -> list[tuple[date, float]]:
+    """yfinance `Ticker.splits` (index = split date, value = ratio, e.g. 10.0
+    for 10-for-1) as (date, ratio) pairs."""
+    if series is None or series.empty:
+        return []
+    return [
+        (pd.Timestamp(ts).date(), float(ratio))
+        for ts, ratio in series.items()
+        if _float_or_none(ratio) and float(ratio) > 0
+    ]
+
+
+def split_adjust(
+    actions: list[AnalystAction], splits: list[tuple[date, float]]
+) -> list[AnalystAction]:
+    """Rescale price targets onto today's split-adjusted basis, matching the
+    split-adjusted closes they are compared against. A target issued before a
+    split is divided by every split ratio dated after it (e.g. a pre-split
+    NVDA target of $1,200 becomes $120 after its 10-for-1 split)."""
+    if not splits:
+        return actions
+
+    def factor(issued: date) -> float:
+        total = 1.0
+        for split_date, ratio in splits:
+            if split_date > issued:
+                total *= ratio
+        return total
+
+    adjusted = []
+    for action in actions:
+        f = factor(action.at.date())
+        if f == 1.0:
+            adjusted.append(action)
+            continue
+        adjusted.append(
+            replace(
+                action,
+                price_target=action.price_target / f if action.price_target else None,
+                prior_price_target=(
+                    action.prior_price_target / f if action.prior_price_target else None
+                ),
+            )
+        )
+    return adjusted
+
+
 def parse_search_news(ticker: str, items: list[dict[str, Any]]) -> list[Headline]:
     headlines = []
     for item in items:
@@ -159,8 +209,12 @@ class YFinanceMarketDataSource:
 
     async def analyst_actions(self, ticker: str) -> list[AnalystAction]:
         async def fetch() -> list[AnalystAction]:
-            frame = await asyncio.to_thread(lambda: yf.Ticker(ticker).upgrades_downgrades)
-            return parse_upgrades_downgrades(frame)
+            def load() -> list[AnalystAction]:
+                yf_ticker = yf.Ticker(ticker)
+                actions = parse_upgrades_downgrades(yf_ticker.upgrades_downgrades)
+                return split_adjust(actions, parse_splits(yf_ticker.splits))
+
+            return await asyncio.to_thread(load)
 
         return await self._actions.get(ticker, fetch)
 

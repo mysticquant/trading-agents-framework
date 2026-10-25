@@ -91,5 +91,5 @@ async def test_a_failing_source_only_degrades_the_evidence_it_feeds():
 async def test_without_a_filings_source_news_says_filings_are_unavailable():
     bundle = await _provider(_FakeMarket()).get_evidence("AAPL", datetime(2024, 6, 3), 100.0)
 
-    assert "SEC filings were not available" in bundle.news["note"]
+    assert "SEC filings were not available" in bundle.news["coverage_note"]
     assert "source_errors" not in bundle.news

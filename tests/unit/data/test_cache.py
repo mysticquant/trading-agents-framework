@@ -89,3 +89,28 @@ async def test_coverage_is_never_recorded_past_yesterday(tmp_path):
     assert covered is not None and covered[1] == today - timedelta(days=1)
     # Today may not have a final bar yet, so a request through today refetches.
     assert len(inner.fetches) == 2
+
+
+async def test_a_request_far_from_the_cached_range_is_not_widened_across_the_gap(tmp_path):
+    inner = _WeekdayProvider()
+    cache = ParquetCache(tmp_path)
+    provider = CachedDataProvider(inner, cache)
+    await provider.get_bars("AAPL", date(2020, 1, 1), date(2020, 2, 1), "1d")
+
+    await provider.get_bars("AAPL", date(2024, 1, 1), date(2024, 2, 1), "1d")
+
+    # Fetched only what was asked for, not the four years in between.
+    assert inner.fetches[-1] == (date(2024, 1, 1), date(2024, 2, 1))
+    assert cache.covered_range("AAPL", "1d") == (date(2024, 1, 1), date(2024, 2, 1))
+
+
+async def test_intraday_requests_are_never_widened(tmp_path):
+    inner = _WeekdayProvider()
+    provider = CachedDataProvider(inner, ParquetCache(tmp_path))
+    await provider.get_bars("AAPL", date(2024, 1, 1), date(2024, 2, 29), "5m")
+
+    # Adjacent to the cached range, but a union would exceed yfinance's
+    # ~60-day intraday history and could come back empty.
+    await provider.get_bars("AAPL", date(2024, 3, 1), date(2024, 3, 5), "5m")
+
+    assert inner.fetches[-1] == (date(2024, 3, 1), date(2024, 3, 5))

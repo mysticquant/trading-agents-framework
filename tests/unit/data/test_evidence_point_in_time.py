@@ -86,8 +86,9 @@ def test_statements_become_public_at_their_earnings_release():
 def test_statements_without_a_release_use_the_filing_lag():
     q = _quarter(date(2024, 6, 30), 120.0)
     public_at = statement_public_at(q, [])
-    # 45 days after the end of the quarter's last day (US/Eastern).
-    assert public_at.date() == date(2024, 7, 1) + timedelta(days=45)
+    # 90 days after the end of the quarter's last day (US/Eastern): late
+    # enough even for fiscal-year results, which come with the 10-K.
+    assert public_at.date() == date(2024, 7, 1) + timedelta(days=90)
 
 
 def test_fundamentals_exclude_an_earnings_release_on_the_decision_day():
@@ -204,14 +205,19 @@ def test_snapshot_values_are_used_only_for_live_decisions():
     historical = sentiment_evidence(
         actions=[], snapshot=snapshot, as_of=datetime(2024, 1, 3), price=100.0, now=now
     )
-    live = sentiment_evidence(
-        actions=[], snapshot=snapshot, as_of=datetime(2024, 6, 3, 12), price=100.0, now=now
+    live = sentiment_evidence(  # 13:30 New York = 17:30 UTC, 30 min before now
+        actions=[], snapshot=snapshot, as_of=datetime(2024, 6, 3, 13, 30), price=100.0, now=now
+    )
+    two_days_back = sentiment_evidence(  # e.g. a recent backtest day
+        actions=[], snapshot=snapshot, as_of=datetime(2024, 6, 1), price=100.0, now=now
     )
 
     assert "short_percent_of_float" not in historical["metrics"]
     assert historical["note"] == UNAVAILABLE_NOTE
     assert live["metrics"]["short_percent_of_float"] == 0.02
     assert live["metrics"]["recommendation_mean"] == 1.8
+    # Today's snapshot must not leak into a recent backtest day.
+    assert "short_percent_of_float" not in two_days_back["metrics"]
 
 
 _FILINGS = [
@@ -237,7 +243,10 @@ def test_news_lists_recent_filings_before_the_cutoff():
     ]
     # The exhibit-only 8-K isn't a material event.
     assert evidence["metrics"]["material_8k_filings"] == 1.0
-    assert "Headlines exist only for recent dates" in evidence["note"]
+    assert "Headlines exist only for recent dates" in evidence["coverage_note"]
+    # Filings are present, so nothing says the evidence is unavailable
+    # (the prompt turns that into a forced low-confidence neutral).
+    assert "note" not in evidence
 
 
 def test_news_marks_a_missing_filings_source_as_unavailable():
@@ -245,8 +254,8 @@ def test_news_marks_a_missing_filings_source_as_unavailable():
         filings=None, headlines=None, as_of=datetime(2024, 6, 3), now=_utc(2026, 1, 1)
     )
 
-    assert "SEC filings were not available" in evidence["note"]
-    assert UNAVAILABLE_NOTE in evidence["note"]
+    assert "SEC filings were not available" in evidence["coverage_note"]
+    assert evidence["note"] == UNAVAILABLE_NOTE
 
 
 def test_news_includes_recent_headlines_for_live_decisions():

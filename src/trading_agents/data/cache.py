@@ -102,12 +102,20 @@ class CachedDataProvider:
             cached = self._cache.read(ticker, timeframe) or []
             return [bar for bar in cached if start <= bar.timestamp.date() <= end]
 
-        # Fetch the union of the request and what's already cached, so the
-        # rewritten file stays one contiguous, complete range instead of
-        # discarding previously cached history.
+        # For daily bars that overlap or adjoin the cached range, fetch the
+        # union, so the rewritten file stays one contiguous, complete range
+        # instead of discarding history. Otherwise fetch just the request
+        # (replacing the cache): widening across a gap would refetch years,
+        # and intraday providers only serve recent history (yfinance: ~60
+        # days of 5m bars), so a widened intraday request could come back empty.
         fetch_start, fetch_end = start, end
         covered = self._cache.covered_range(ticker, timeframe)
-        if covered is not None:
+        if (
+            covered is not None
+            and timeframe == "1d"
+            and start <= covered[1] + timedelta(days=1)
+            and end >= covered[0] - timedelta(days=1)
+        ):
             fetch_start, fetch_end = min(start, covered[0]), max(end, covered[1])
 
         fetched = await self._inner.get_bars(ticker, fetch_start, fetch_end, timeframe)
