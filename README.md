@@ -7,9 +7,9 @@ Researcher, a Trader, a Risk Manager, and a Portfolio Manager collaborate
 on each trading decision.
 
 It has a fully testable Python core, a simulated (paper) broker with a
-backtest runner, and adapters for Interactive Brokers (paper accounts by
-default) and Zerodha Kite (orders disabled by default). A live trading
-loop and a low-latency Rust/C++ execution service are future work — see
+backtest runner, adapters for Interactive Brokers and Zerodha Kite, and a
+guarded live trading loop that runs in dry-run mode unless told
+otherwise. A low-latency Rust/C++ execution service is future work — see
 "Out of scope" below.
 
 ## Setup
@@ -106,9 +106,8 @@ Safety and behavior:
   `OrderRejectedError` with IB's reason.
 - Only US stocks are mapped (`SMART` routing, USD).
 
-Nothing in the agent pipeline places IB orders yet — the backtest always
-uses `PaperBrokerAdapter`. Wiring a real broker into a trading loop, with
-its own safeguards, is the next piece of future work.
+The backtest always uses `PaperBrokerAdapter`; IB orders are placed only
+by the live trading loop (below).
 
 ## Zerodha Kite
 
@@ -119,7 +118,8 @@ a Kite Connect app (API key and secret, with its redirect URL set) in
 
 **Kite has no paper trading: every order is real money.** The adapter
 refuses to place orders unless it is built with `allow_live=True`; reads
-always work. Nothing in the pipeline places Kite orders yet.
+always work. Only the live trading loop in `--mode live` builds it that
+way.
 
 Daily login — Kite access tokens expire at 6 AM IST:
 
@@ -144,6 +144,56 @@ Behavior and requirements:
   limits, and requests are throttled to Kite's published rate limits.
 - Kite's order APIs don't report charges, so `Order.commission` is 0.
 
+## Live trading loop
+
+`trading-agents trade` runs one decision cycle per trading day at a
+scheduled time — by default 30 minutes before the close (15:30 New York
+for IB, 15:00 Mumbai for Kite; `LIVE_DECISION_TIME=HH:MM` to change) —
+against the broker in `LIVE_BROKER` (`ib` or `kite`):
+
+```powershell
+.venv\Scripts\trading-agents trade --once            # one dry-run cycle now
+.venv\Scripts\trading-agents trade                   # dry-run, every weekday
+.venv\Scripts\trading-agents trade --mode paper      # IB paper account
+.venv\Scripts\trading-agents trade --mode live       # REAL orders (see below)
+```
+
+| Mode | What happens | IB | Kite |
+|---|---|---|---|
+| `dry-run` (default) | Full cycle; orders it *would* send are journaled, nothing is sent | read-only connection | orders disabled |
+| `paper` | Orders go to a paper account | paper accounts only | refused (no paper trading) |
+| `live` | Real orders | needs both opt-ins | needs both opt-ins |
+
+**Real money needs two independent opt-ins:** `--mode live` on the command
+line *and* `ALLOW_LIVE_TRADING=true` in `.env`.
+
+Guardrails, enforced in Python after the agents decide (they can only
+shrink or block an order) and configurable in `.env`:
+
+| Guardrail | Default | Setting |
+|---|---|---|
+| Max size of one buy | 5% of equity (whole shares) | `LIVE_MAX_ORDER_PCT` |
+| Max orders sent per day | 10 | `LIVE_MAX_ORDERS_PER_DAY` |
+| Stop trading for the day after a drawdown from the day's starting equity | 2% | `LIVE_MAX_DAILY_DRAWDOWN_PCT` |
+| Kill switch: while this file exists, nothing is sent | `KILL_SWITCH` | `LIVE_KILL_SWITCH_PATH` |
+
+These come on top of the agents' own limits (the risk manager's 10%
+per-ticker position cap and the portfolio manager's cash check). Sells
+are not size-capped, since they reduce exposure. The kill switch is
+checked before every order, so creating the file mid-cycle stops the
+orders not yet sent. The day's counters are saved under `data/live/`, so
+restarting the loop doesn't reset them.
+
+Every cycle appends one JSON line to `data/live/<broker>-journal.jsonl`:
+each decision, any guardrail that trimmed or blocked it, and the order's
+outcome. Days with no bar dated today (holidays) are skipped, as are
+tickers whose data is stale. An IB connection or a Kite token that has
+expired skips that day's cycle; for Kite, run `kite-login` each morning.
+
+Known gaps: Kite symbols run on technical analysis only (the evidence
+sources are US-centric), and there is no market-holiday calendar beyond
+the "no bar today" check.
+
 ## Architecture
 
 - `contracts/` — pydantic data contracts shared by every layer (market
@@ -167,6 +217,9 @@ Behavior and requirements:
 - `orchestration/` — `DecisionCycleOrchestrator`, a hand-rolled async
   pipeline (Screener → 4 parallel Analysts per ticker → Researcher →
   Trader → RiskManager → PortfolioManager) over a shared state object.
+- `live/` — `LiveTradingLoop` (scheduling, modes, journal) and
+  `guardrails.py` (order limits, drawdown halt, kill switch, persisted
+  daily state); wired up by `cli/trade.py`.
 - `backtest/` — `BacktestRunner` (drives the orchestrator day-by-day
   against `PaperBrokerAdapter`) and `metrics.py` (return, Sharpe, max
   drawdown, win rate).
@@ -212,8 +265,6 @@ so fundamentals are close to, but not exactly, what was known at the time.
 - A **Rust/C++ low-latency execution service** for live order routing,
   reached from Python over gRPC or a local socket/queue, implementing the
   same `BrokerAdapter` Protocol.
-- Live trading of any kind — everything today runs against
-  `PaperBrokerAdapter`.
 - **Further LLM providers.** Claude and local Ollama models are
   supported; `LLMClient` is a `Protocol`, so another implementation can be
   added without touching `agents/` or `orchestration/`.

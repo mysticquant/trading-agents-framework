@@ -11,6 +11,7 @@ for the manual opt-in live-LLM smoke tests.
 
 import argparse
 import asyncio
+import logging
 import sys
 
 from pydantic import ValidationError
@@ -34,6 +35,7 @@ from trading_agents.brokers.kite import (
     login_url,
 )
 from trading_agents.brokers.paper import PaperBrokerAdapter
+from trading_agents.cli.trade import build_trading_loop, describe
 from trading_agents.config.settings import ConfigurationError, Settings
 from trading_agents.contracts.backtest import BacktestResult
 from trading_agents.contracts.trading import ExecutionCosts
@@ -43,6 +45,7 @@ from trading_agents.data.evidence.provider import DefaultEvidenceProvider
 from trading_agents.data.evidence.sec_edgar import SecEdgarFilingsSource
 from trading_agents.data.evidence.yfinance_source import YFinanceMarketDataSource
 from trading_agents.data.providers.yfinance_provider import YFinanceProvider
+from trading_agents.live.loop import Mode
 from trading_agents.llm.client import AnthropicLLMClient, LLMClient
 from trading_agents.llm.config import LLMRoleRegistry, RoleModelConfig
 from trading_agents.llm.ollama_client import OllamaError, OllamaLLMClient
@@ -118,11 +121,15 @@ AGENT_ROLES = (
 )
 
 
+async def preflight_llm(llm_client: LLMClient, role_registry: LLMRoleRegistry) -> None:
+    """Fail before a long run, not after every cycle has errored."""
+    if isinstance(llm_client, OllamaLLMClient):
+        await llm_client.check_models({role_registry.for_role(r).model for r in AGENT_ROLES})
+
+
 async def run_backtest(settings: Settings) -> BacktestResult:
     llm_client, role_registry = build_llm(settings)
-    if isinstance(llm_client, OllamaLLMClient):
-        # Fail now, not after every simulated day has errored.
-        await llm_client.check_models({role_registry.for_role(r).model for r in AGENT_ROLES})
+    await preflight_llm(llm_client, role_registry)
     # One cost model shared by the broker and the agents that size buys, so
     # cash-limited trades are sized to what the broker will actually charge.
     execution_costs = ExecutionCosts()
@@ -248,6 +255,21 @@ async def kite_check(settings: Settings) -> list[str]:
     return lines
 
 
+async def run_trade(settings: Settings, mode: Mode, *, once: bool) -> None:
+    loop = await build_trading_loop(settings, mode)
+    for line in describe(loop, settings):
+        print(line)
+    try:
+        if once:
+            report = await loop.run_once()
+            print(f"Cycle done: {report.skipped_reason or f'{len(report.decisions)} decision(s)'}")
+        else:
+            await loop.run_forever()
+    finally:
+        if loop.broker.is_connected():
+            await loop.broker.disconnect()
+
+
 def _print_backtest(result: BacktestResult) -> None:
     print(f"Period: {result.start_date} -> {result.end_date}")
     print(f"Universe: {', '.join(result.ticker_universe)}")
@@ -281,6 +303,19 @@ def main() -> None:
     subparsers.add_parser(
         "kite-check", help="Connect to Zerodha Kite read-only and show the account"
     )
+    trade_parser = subparsers.add_parser(
+        "trade", help="Run the live trading loop (dry-run unless told otherwise)"
+    )
+    trade_parser.add_argument(
+        "--mode",
+        choices=["dry-run", "paper", "live"],
+        default="dry-run",
+        help="dry-run (default): journal decisions, send nothing; paper: paper account; "
+        "live: real orders (also needs ALLOW_LIVE_TRADING=true)",
+    )
+    trade_parser.add_argument(
+        "--once", action="store_true", help="Run one decision cycle now and exit"
+    )
 
     args = parser.parse_args()
 
@@ -300,6 +335,12 @@ def main() -> None:
             lines = asyncio.run(kite_login(settings, args.request_token))
         elif args.command == "kite-check":
             lines = asyncio.run(kite_check(settings))
+        elif args.command == "trade":
+            logging.basicConfig(
+                level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+            )
+            asyncio.run(run_trade(settings, args.mode, once=args.once))
+            lines = []
         else:
             lines = []
             _print_backtest(asyncio.run(run_backtest(settings)))
@@ -311,7 +352,7 @@ def main() -> None:
     except ModuleNotFoundError as exc:
         if exc.name != "ib_async":
             raise
-        sys.exit('trading-agents: ib-check needs the IB extra: pip install -e ".[ib]"')
+        sys.exit('trading-agents: this command needs the IB extra: pip install -e ".[ib]"')
     except (ConfigurationError, OllamaError, BrokerError) as exc:
         sys.exit(f"trading-agents: {exc}")
 
