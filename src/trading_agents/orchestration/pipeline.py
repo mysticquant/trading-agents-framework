@@ -199,6 +199,9 @@ class DecisionCycleOrchestrator:
                 )
             except Exception as exc:
                 logger.exception("Ticker pipeline failed for %s at %s", ticker, as_of)
+                # A TaskGroup wraps failures; report the underlying error.
+                while isinstance(exc, ExceptionGroup) and len(exc.exceptions) == 1:
+                    exc = exc.exceptions[0]
                 ticker_state.error = f"{type(exc).__name__}: {exc}"
             return ticker_state
 
@@ -223,23 +226,34 @@ class DecisionCycleOrchestrator:
             fundamentals_evidence = fundamentals_evidence or bundle.fundamentals
             sentiment_evidence = sentiment_evidence or bundle.sentiment
             news_evidence = news_evidence or bundle.news
-        (
-            fundamentals_report,
-            sentiment_report,
-            news_report,
-            technical_report,
-        ) = await asyncio.gather(
-            self.fundamentals_analyst.run(
-                AnalystInput(ticker=ticker, as_of=as_of, evidence=fundamentals_evidence)
-            ),
-            self.sentiment_analyst.run(
-                AnalystInput(ticker=ticker, as_of=as_of, evidence=sentiment_evidence)
-            ),
-            self.news_analyst.run(AnalystInput(ticker=ticker, as_of=as_of, evidence=news_evidence)),
-            self.technical_analyst.run(
-                TechnicalAnalystInput(ticker=ticker, as_of=as_of, bars=bars)
-            ),
-        )
+        # A TaskGroup (not gather): if one analyst call fails, the others are
+        # cancelled instead of running on unobserved, past the per-ticker
+        # concurrency cap, still spending tokens.
+        async with asyncio.TaskGroup() as analysts:
+            fundamentals_task = analysts.create_task(
+                self.fundamentals_analyst.run(
+                    AnalystInput(ticker=ticker, as_of=as_of, evidence=fundamentals_evidence)
+                )
+            )
+            sentiment_task = analysts.create_task(
+                self.sentiment_analyst.run(
+                    AnalystInput(ticker=ticker, as_of=as_of, evidence=sentiment_evidence)
+                )
+            )
+            news_task = analysts.create_task(
+                self.news_analyst.run(
+                    AnalystInput(ticker=ticker, as_of=as_of, evidence=news_evidence)
+                )
+            )
+            technical_task = analysts.create_task(
+                self.technical_analyst.run(
+                    TechnicalAnalystInput(ticker=ticker, as_of=as_of, bars=bars)
+                )
+            )
+        fundamentals_report = fundamentals_task.result()
+        sentiment_report = sentiment_task.result()
+        news_report = news_task.result()
+        technical_report = technical_task.result()
         ticker_state.analyst_reports = [
             fundamentals_report,
             sentiment_report,

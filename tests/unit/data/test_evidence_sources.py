@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime
 import pandas as pd
 import pytest
 
+from trading_agents.data.evidence.base import AnalystAction
 from trading_agents.data.evidence.memo import AsyncTTLCache
 from trading_agents.data.evidence.sec_edgar import (
     SecEdgarFilingsSource,
@@ -12,8 +13,10 @@ from trading_agents.data.evidence.sec_edgar import (
 from trading_agents.data.evidence.yfinance_source import (
     parse_earnings_dates,
     parse_search_news,
+    parse_splits,
     parse_statements,
     parse_upgrades_downgrades,
+    split_adjust,
 )
 
 
@@ -194,15 +197,64 @@ async def test_ttl_cache_refetches_only_after_expiry():
     assert await cache.get("k", fetch) == 2
 
 
-async def test_ttl_cache_does_not_cache_failures():
-    cache: AsyncTTLCache[int] = AsyncTTLCache(10.0)
+async def test_ttl_cache_remembers_failures_briefly_then_retries():
+    clock = {"now": 0.0}
+    cache: AsyncTTLCache[int] = AsyncTTLCache(
+        600.0, clock=lambda: clock["now"], failure_ttl_seconds=60.0
+    )
+    attempts = 0
 
     async def boom() -> int:
-        raise RuntimeError("down")
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("SEC says 403")
 
     async def ok() -> int:
         return 7
 
-    with pytest.raises(RuntimeError):
-        await cache.get("k", boom)
-    assert await cache.get("k", ok) == 7
+    for _ in range(3):  # e.g. three tickers on the same simulated day
+        with pytest.raises(RuntimeError, match="403"):
+            await cache.get("k", boom)
+    assert attempts == 1  # the failing source was only hit once
+
+    clock["now"] = 61.0
+    assert await cache.get("k", ok) == 7  # retried after the failure window
+
+
+def _action(at: datetime, target: float | None, prior: float | None) -> AnalystAction:
+    return AnalystAction(
+        at=at,
+        firm="F",
+        action="main",
+        to_grade="Buy",
+        from_grade="Buy",
+        price_target=target,
+        prior_price_target=prior,
+    )
+
+
+def test_split_adjust_rescales_targets_issued_before_a_split():
+    # NVDA: targets stored as issued (~$1,200), prices split-adjusted (~$95).
+    splits = parse_splits(
+        pd.Series([4.0, 10.0], index=pd.DatetimeIndex(["2021-07-20", "2024-06-10"]))
+    )
+    actions = [
+        _action(datetime(2024, 5, 23, 17, tzinfo=UTC), 1200.0, 1000.0),  # before 10:1
+        _action(datetime(2021, 1, 5, 17, tzinfo=UTC), 640.0, None),  # before both
+        _action(datetime(2024, 6, 20, 17, tzinfo=UTC), 140.0, 130.0),  # after both
+    ]
+
+    before_10, before_both, after = split_adjust(actions, splits)
+
+    assert (before_10.price_target, before_10.prior_price_target) == (120.0, 100.0)
+    assert before_both.price_target == 16.0  # / 4 / 10
+    assert before_both.prior_price_target is None
+    assert (after.price_target, after.prior_price_target) == (140.0, 130.0)
+
+
+def test_parse_splits_handles_no_splits():
+    assert parse_splits(pd.Series(dtype=float)) == []
+    assert (
+        split_adjust([_action(datetime(2024, 1, 1, tzinfo=UTC), 10.0, 9.0)], [])[0].price_target
+        == 10.0
+    )

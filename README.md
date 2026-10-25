@@ -305,8 +305,21 @@ the analyst prompts tell the model to return a low-confidence neutral
 signal rather than reading meaning into missing data.
 
 Raw data is cached in memory (6 hours) so a backtest fetches each source
-once per ticker per run. yfinance values can be restated after the fact,
-so fundamentals are close to, but not exactly, what was known at the time.
+once per ticker per run; a failing source is remembered for 5 minutes
+rather than retried for every ticker on every day. yfinance values can be
+restated after the fact, so fundamentals are close to, but not exactly,
+what was known at the time.
+
+Details that keep the evidence honest:
+- Analyst price targets are stored by Yahoo as issued, while prices are
+  split-adjusted; targets are rescaled with the split history so "implied
+  upside" compares like with like (NVDA before its 2024 10-for-1 split
+  otherwise shows about +1,000%).
+- A quarter with no known earnings date is treated as public 90 days after
+  it ends, the latest SEC deadline (10-K), so it can only be late, never
+  early.
+- Current-only values (short interest, consensus rating) are used only for
+  a decision made right now, never for a past or recent backtest day.
 
 ## Known gaps in this phase
 

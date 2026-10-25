@@ -280,3 +280,47 @@ async def test_one_failing_ticker_does_not_abort_the_cycle(bars_factory, canned_
     assert aapl.error is None
     assert aapl.portfolio_decision is not None
     assert aapl.portfolio_decision.final_action == "buy"
+
+
+async def test_a_failed_analyst_call_cancels_that_tickers_other_calls(
+    bars_factory, canned_responses
+):
+    import asyncio
+
+    started: list[str] = []
+    cancelled: list[str] = []
+
+    class ClientWithOneFailure(FakeLLMClient):
+        async def generate_structured(self, **kwargs):
+            role = kwargs["role"]
+            if role == "news_analyst":
+                await asyncio.sleep(0.01)
+                raise RuntimeError("overloaded")
+            if role in ("fundamentals_analyst", "sentiment_analyst"):
+                started.append(role)
+                try:
+                    await asyncio.sleep(5)  # a slow call still in flight
+                except asyncio.CancelledError:
+                    cancelled.append(role)
+                    raise
+            return await super().generate_structured(**kwargs)
+
+    canned_responses["screener"] = ScreenerLLMOutput(
+        rankings=[ScreenerRanking(ticker="AAPL", score=0.9, rationale="a")]
+    )
+    orchestrator = _build_orchestrator(ClientWithOneFailure(canned_responses))
+
+    state = await asyncio.wait_for(
+        orchestrator.run_cycle(
+            as_of=datetime(2024, 1, 1),
+            universe=["AAPL"],
+            market_data={"AAPL": bars_factory("AAPL", 60)},
+            portfolio_state=PortfolioState(
+                cash=100_000.0, equity=100_000.0, realized_pnl=0.0, as_of=datetime(2024, 1, 1)
+            ),
+        ),
+        timeout=2,  # would take 5s if the slow calls were left running
+    )
+
+    assert state.per_ticker["AAPL"].error == "RuntimeError: overloaded"
+    assert sorted(cancelled) == sorted(started) == ["fundamentals_analyst", "sentiment_analyst"]

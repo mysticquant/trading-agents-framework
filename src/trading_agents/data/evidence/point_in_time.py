@@ -27,12 +27,16 @@ from trading_agents.data.evidence.base import (
 EXCHANGE_TZ = ZoneInfo("America/New_York")
 
 # A quarter's statements are public once its earnings are released. When no
-# matching release is known, assume the 10-Q filing deadline (40-45 days).
+# matching release is known, assume the latest SEC deadline that could apply:
+# fiscal-year results come with the 10-K (60-90 days), not the 10-Q (40-45).
+# Later than the truth only delays data; earlier would leak the future.
 _RELEASE_SEARCH_WINDOW = timedelta(days=120)
-_FALLBACK_REPORT_LAG = timedelta(days=45)
+_FALLBACK_REPORT_LAG = timedelta(days=90)
 
-# Snapshot-only values (no history) are used only for decisions this recent.
-_LIVE_WINDOW = timedelta(days=3)
+# Snapshot-only values (no history, fetched now) are used only for decisions
+# made right now: a live cycle passes the current time as `as_of`. Anything
+# older, including recent backtest days, would see data from after it.
+_LIVE_WINDOW = timedelta(hours=1)
 
 UNAVAILABLE_NOTE = (
     "No data of this kind was available for this ticker as of this date. "
@@ -317,16 +321,19 @@ def news_evidence(
         ],
     }
 
-    notes = []
+    # Which sources are missing goes in `coverage_note`, so it never reads
+    # as "no evidence": the analyst still weighs any filings or headlines
+    # present. `note` is set only when there is nothing at all.
+    coverage = []
     if filings is None:
-        notes.append("SEC filings were not available for this run.")
+        coverage.append("SEC filings were not available for this run.")
     if not recent_headlines and not is_live(as_of, now):
-        notes.append(
+        coverage.append(
             "Headlines exist only for recent dates, so none are available for "
             "this historical date — do not read anything into their absence."
         )
+    if coverage:
+        evidence["coverage_note"] = " ".join(coverage)
     if not recent_filings and not recent_headlines:
-        notes.append(UNAVAILABLE_NOTE)
-    if notes:
-        evidence["note"] = " ".join(notes)
+        evidence["note"] = UNAVAILABLE_NOTE
     return evidence
